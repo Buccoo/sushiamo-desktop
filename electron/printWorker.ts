@@ -1,0 +1,1017 @@
+import fs from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import type { BrowserWindow } from "electron";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+
+type RuntimeConfig = {
+  VITE_SUPABASE_URL: string;
+  VITE_SUPABASE_ANON_KEY: string;
+};
+
+type WorkerConfig = {
+  consumerId: string;
+  deviceName: string;
+  pollMs: number;
+  claimLimit: number;
+  autoStart: boolean;
+};
+
+type SessionSnapshot = {
+  access_token: string;
+  refresh_token: string;
+  expires_at: number | null;
+};
+
+type WorkerLogRow = {
+  at: string;
+  level: "INFO" | "WARN" | "ERROR";
+  message: string;
+};
+
+type RestaurantScope = {
+  id: string;
+  name: string;
+  city: string | null;
+  role: "owner" | "admin" | "manager" | "staff";
+};
+
+type JobRow = {
+  id: string;
+  department: string | null;
+  payload: Record<string, unknown> | null;
+  route: Record<string, unknown> | null;
+  created_at: string;
+};
+
+type LivePrinter = {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  enabled: boolean;
+  departments: string[];
+};
+
+type LiveRoutes = {
+  byId: Map<string, LivePrinter>;
+  byDepartment: Map<string, LivePrinter>;
+  defaultPrinterId: string | null;
+};
+
+type DiscoverPrinter = {
+  host: string;
+  port: number;
+  connection_type: "ethernet" | "wifi" | "unknown";
+  interface_name: string | null;
+  interface_ip: string | null;
+  source: "lan_scan";
+  label: string;
+};
+
+type WorkerPublicState = {
+  config: WorkerConfig;
+  auth: {
+    user: { id: string; email: string | null } | null;
+    restaurant: RestaurantScope | null;
+  };
+  service: {
+    running: boolean;
+    processing: boolean;
+    assignedPrinterId: string | null;
+    stats: {
+      claimed: number;
+      printed: number;
+      failed: number;
+      lastRunAt: string | null;
+      lastError: string | null;
+    };
+  };
+  logs: WorkerLogRow[];
+};
+
+type PrintWorkerDeps = {
+  runtimeConfig: RuntimeConfig;
+  userDataPath: string;
+  appVersion: string;
+  onMainLog?: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+};
+
+const CONFIG_FILENAME = "desktop-print-worker.json";
+const DISCOVERY_PORTS = [9100, 515, 631];
+const DISCOVERY_TIMEOUT_MIN = 120;
+const DISCOVERY_TIMEOUT_MAX = 2000;
+const DISCOVERY_TIMEOUT_DEFAULT = 350;
+const DISCOVERY_CONCURRENCY = 96;
+const DISCOVERY_MAX_HOSTS = 1024;
+const LOG_CAP = 500;
+
+const roleRank: Record<RestaurantScope["role"], number> = {
+  owner: 1,
+  admin: 2,
+  manager: 3,
+  staff: 4,
+};
+
+function normalizeError(error: unknown) {
+  if (!error) return "Errore sconosciuto";
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message || "Errore sconosciuto";
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function sanitizeConsumerId(value: unknown) {
+  const raw = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._:-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  if (raw) return raw;
+  const host = String(os.hostname() || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  const prefix = process.platform === "win32" ? "win" : process.platform === "darwin" ? "mac" : "bridge";
+  return `${prefix}-bridge-${host || "main"}`.slice(0, 64);
+}
+
+function sanitizeDeviceName(value: unknown) {
+  const normalized = String(value ?? "").trim().replace(/\s+/g, " ").slice(0, 80);
+  return normalized || `Bridge ${os.hostname()}`;
+}
+
+function sanitizePollMs(value: unknown) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 2500;
+  return Math.max(1000, Math.min(10000, Math.trunc(n)));
+}
+
+function sanitizeClaimLimit(value: unknown) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 5;
+  return Math.max(1, Math.min(20, Math.trunc(n)));
+}
+
+function sanitizePrinterPort(value: unknown) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 9100;
+  const port = Math.trunc(n);
+  return port >= 1 && port <= 65535 ? port : 9100;
+}
+
+function normalizeDepartment(value: unknown) {
+  const dep = String(value ?? "").trim().toLowerCase();
+  return dep || "cucina";
+}
+
+function toSessionSnapshot(raw: unknown): SessionSnapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const session = raw as Record<string, unknown>;
+  const accessToken = String(session.access_token || "").trim();
+  const refreshToken = String(session.refresh_token || "").trim();
+  if (!accessToken || !refreshToken) return null;
+  const expiresAt = Number(session.expires_at);
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    expires_at: Number.isFinite(expiresAt) ? Math.trunc(expiresAt) : null,
+  };
+}
+
+function sameSession(a: SessionSnapshot | null, b: SessionSnapshot | null) {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.access_token === b.access_token && a.refresh_token === b.refresh_token && Number(a.expires_at || 0) === Number(b.expires_at || 0);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryPrintLocally(error: unknown) {
+  const message = normalizeError(error).toLowerCase();
+  return (
+    message.includes("timeout") ||
+    message.includes("econnreset") ||
+    message.includes("ehostunreach") ||
+    message.includes("econnrefused") ||
+    message.includes("epipe")
+  );
+}
+
+function openRawSocket(host: string, port: number, payload: Buffer, timeoutMs = 25000) {
+  return new Promise<void>((resolve, reject) => {
+    const socket = new net.Socket();
+    let done = false;
+    const complete = (error?: Error | null) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      if (error) reject(error);
+      else resolve();
+    };
+    socket.setNoDelay(true);
+    socket.setTimeout(timeoutMs);
+    socket.once("error", (error) => complete(error));
+    socket.once("timeout", () => complete(new Error("Timeout stampante")));
+    socket.connect(port, host, () => {
+      socket.write(payload, (error) => {
+        if (error) {
+          complete(error);
+          return;
+        }
+        socket.end(() => complete(null));
+      });
+    });
+    socket.once("close", (hadError) => {
+      if (hadError) return;
+      if (!done) complete(null);
+    });
+  });
+}
+
+function wrapText(input: string, width: number) {
+  const text = String(input || "").trim();
+  if (!text) return [""];
+  if (text.length <= width) return [text];
+  const words = text.split(/\s+/);
+  const lines: string[] = [];
+  let current = "";
+  for (const word of words) {
+    if (!current) {
+      current = word;
+      continue;
+    }
+    if (`${current} ${word}`.length <= width) {
+      current += ` ${word}`;
+      continue;
+    }
+    lines.push(current);
+    current = word;
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+function formatTimestamp(value: unknown) {
+  if (!value) return "";
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("it-IT", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+function renderTicket(job: JobRow) {
+  const width = 42;
+  const payload = (job.payload || {}) as Record<string, unknown>;
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const department = normalizeDepartment(payload.department || job.department);
+  const restaurantName = String(payload.restaurant_name || "").trim() || "Ristorante";
+  const tableLabel = String(payload.table_number || "").trim() || "-";
+  const orderLabel = payload.order_number != null ? `#${String(payload.order_number)}` : "#-";
+  const createdAt = formatTimestamp(payload.created_at || job.created_at);
+  const lines: string[] = [];
+  lines.push(`${orderLabel} - COMANDA ${department}`);
+  lines.push("-".repeat(width));
+  lines.push(`TAVOLO: ${tableLabel.toUpperCase()}`);
+  lines.push("");
+  for (const rawItem of items) {
+    const item = (rawItem || {}) as Record<string, unknown>;
+    const qty = Math.max(1, Number(item.quantity) || 1);
+    const itemNumber = item.item_number != null ? `#${String(item.item_number)} ` : "";
+    const label = `${qty}x ${itemNumber}${String(item.name || "").trim()}`;
+    for (const chunk of wrapText(label, width)) lines.push(chunk);
+    const guest = String(item.guest_name || "").trim();
+    if (guest) for (const chunk of wrapText(`Ospite: ${guest}`, width - 2)) lines.push(` ${chunk}`);
+    const notes = String(item.notes || "").trim();
+    if (notes) for (const chunk of wrapText(`Nota: ${notes}`, width - 2)) lines.push(` ${chunk}`);
+  }
+  lines.push("-".repeat(width));
+  lines.push(createdAt ? `${restaurantName} - ${createdAt}` : restaurantName);
+  lines.push("=".repeat(width));
+  return lines.join("\n");
+}
+
+function isBoldLine(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (/^tavolo:/i.test(trimmed)) return true;
+  if (/^\d+\s*x\s+/i.test(trimmed)) return true;
+  return false;
+}
+
+function isLargeLine(line: string) {
+  return /^tavolo:/i.test(line.trim());
+}
+
+function buildEscPosPayload(ticketText: string) {
+  const ESC = 0x1b;
+  const GS = 0x1d;
+  const EXTRA_FEED_LINES = 14;
+  const lines = ticketText.split(/\r?\n/);
+  const chunks = [Buffer.from([ESC, 0x40])];
+  let bold = false;
+  for (const line of lines) {
+    const shouldBold = isBoldLine(line);
+    if (shouldBold !== bold) {
+      chunks.push(Buffer.from([ESC, 0x45, shouldBold ? 0x01 : 0x00]));
+      bold = shouldBold;
+    }
+    if (isLargeLine(line)) chunks.push(Buffer.from([GS, 0x21, 0x11]));
+    chunks.push(Buffer.from(`${line}\n`, "utf8"));
+    if (isLargeLine(line)) chunks.push(Buffer.from([GS, 0x21, 0x00]));
+  }
+  if (bold) chunks.push(Buffer.from([ESC, 0x45, 0x00]));
+  chunks.push(Buffer.from([ESC, 0x64, EXTRA_FEED_LINES]));
+  chunks.push(Buffer.from([GS, 0x56, 0x00]));
+  return Buffer.concat(chunks);
+}
+
+function classifyInterfaceConnectionType(interfaceName: string): "ethernet" | "wifi" | "unknown" {
+  const normalized = interfaceName.toLowerCase();
+  if (!normalized) return "unknown";
+  if (
+    normalized.includes("wi-fi") ||
+    normalized.includes("wifi") ||
+    normalized.includes("wireless") ||
+    normalized.includes("wlan")
+  ) {
+    return "wifi";
+  }
+  if (normalized.includes("ethernet") || normalized.includes("lan") || normalized.startsWith("eth")) {
+    return "ethernet";
+  }
+  return "unknown";
+}
+
+function normalizeIpv4(address: string) {
+  const raw = String(address || "").trim();
+  const parts = raw.split(".");
+  if (parts.length !== 4) return null;
+  const octets = parts.map((part) => Number(part));
+  if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return null;
+  return octets.join(".");
+}
+
+function collectLanTargets() {
+  const interfaces = os.networkInterfaces();
+  const targetsByHost = new Map<
+    string,
+    { host: string; interfaceName: string; interfaceIp: string; connectionType: "ethernet" | "wifi" | "unknown" }
+  >();
+
+  for (const [interfaceName, rows] of Object.entries(interfaces)) {
+    for (const row of rows || []) {
+      const family = typeof row.family === "string" ? row.family : row.family === 4 ? "IPv4" : "IPv6";
+      if (family !== "IPv4") continue;
+      if (row.internal) continue;
+      const ipv4 = normalizeIpv4(row.address || "");
+      if (!ipv4) continue;
+      const [first, second, third, current] = ipv4.split(".").map((part) => Number(part));
+      if (first === 127) continue;
+      if (first === 169 && second === 254) continue;
+      const prefix = `${first}.${second}.${third}`;
+      const connectionType = classifyInterfaceConnectionType(interfaceName);
+
+      for (let host = 1; host <= 254; host += 1) {
+        if (host === current) continue;
+        const candidate = `${prefix}.${host}`;
+        if (targetsByHost.has(candidate)) continue;
+        targetsByHost.set(candidate, {
+          host: candidate,
+          interfaceName,
+          interfaceIp: ipv4,
+          connectionType,
+        });
+      }
+    }
+  }
+
+  return Array.from(targetsByHost.values()).slice(0, DISCOVERY_MAX_HOSTS);
+}
+
+function probeTcpPort(host: string, port: number, timeoutMs: number) {
+  return new Promise<boolean>((resolve) => {
+    const socket = new net.Socket();
+    let done = false;
+    const complete = (isOpen: boolean) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve(isOpen);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => complete(true));
+    socket.once("timeout", () => complete(false));
+    socket.once("error", () => complete(false));
+    socket.connect(port, host);
+  });
+}
+
+async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (item: T, idx: number) => Promise<void>) {
+  if (!items.length) return;
+  const safeConcurrency = Math.max(1, Math.min(concurrency, items.length));
+  let index = 0;
+  const runners = Array.from({ length: safeConcurrency }, async () => {
+    while (index < items.length) {
+      const currentIndex = index;
+      index += 1;
+      await worker(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(runners);
+}
+
+export class DesktopPrintWorker {
+  private readonly runtimeConfig: RuntimeConfig;
+  private readonly appVersion: string;
+  private readonly onMainLog?: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  private readonly configPath: string;
+  private readonly logs: WorkerLogRow[] = [];
+  private readonly authState: { user: { id: string; email: string | null } | null; restaurant: RestaurantScope | null } = {
+    user: null,
+    restaurant: null,
+  };
+  private config: WorkerConfig = {
+    consumerId: sanitizeConsumerId(""),
+    deviceName: sanitizeDeviceName(`Bridge ${os.hostname()}`),
+    pollMs: 2500,
+    claimLimit: 5,
+    autoStart: true,
+  };
+  private savedSession: SessionSnapshot | null = null;
+  private supabase: SupabaseClient | null = null;
+  private boundWindow: BrowserWindow | null = null;
+  private service = {
+    running: false,
+    processing: false,
+    timer: null as NodeJS.Timeout | null,
+    assignedPrinterId: null as string | null,
+    stats: {
+      claimed: 0,
+      printed: 0,
+      failed: 0,
+      lastRunAt: null as string | null,
+      lastError: null as string | null,
+    },
+  };
+
+  constructor(deps: PrintWorkerDeps) {
+    this.runtimeConfig = deps.runtimeConfig;
+    this.appVersion = deps.appVersion;
+    this.onMainLog = deps.onMainLog;
+    this.configPath = path.join(deps.userDataPath, CONFIG_FILENAME);
+  }
+
+  attachWindow(win: BrowserWindow | null) {
+    this.boundWindow = win;
+    this.broadcastState();
+  }
+
+  getPublicState(): WorkerPublicState {
+    return {
+      config: { ...this.config },
+      auth: {
+        user: this.authState.user ? { ...this.authState.user } : null,
+        restaurant: this.authState.restaurant ? { ...this.authState.restaurant } : null,
+      },
+      service: {
+        running: this.service.running,
+        processing: this.service.processing,
+        assignedPrinterId: this.service.assignedPrinterId,
+        stats: { ...this.service.stats },
+      },
+      logs: [...this.logs],
+    };
+  }
+
+  async init() {
+    await this.loadPersistedState();
+    if (this.config.autoStart && this.savedSession) {
+      try {
+        await this.startService();
+      } catch (error) {
+        this.pushLog("WARN", `Avvio automatico non riuscito: ${normalizeError(error)}`);
+      }
+    }
+  }
+
+  async shutdown() {
+    await this.stopService();
+  }
+
+  async saveConfig(partial: Partial<WorkerConfig>) {
+    this.config = {
+      ...this.config,
+      ...partial,
+      consumerId: sanitizeConsumerId(partial.consumerId ?? this.config.consumerId),
+      deviceName: sanitizeDeviceName(partial.deviceName ?? this.config.deviceName),
+      pollMs: sanitizePollMs(partial.pollMs ?? this.config.pollMs),
+      claimLimit: sanitizeClaimLimit(partial.claimLimit ?? this.config.claimLimit),
+      autoStart: partial.autoStart == null ? this.config.autoStart : Boolean(partial.autoStart),
+    };
+    await this.persistState();
+    this.pushLog("INFO", "Configurazione worker stampa aggiornata");
+    return this.getPublicState();
+  }
+
+  async syncSession(rawSession: unknown) {
+    const snapshot = toSessionSnapshot(rawSession);
+    if (!snapshot) throw new Error("SESSION_INVALID");
+    if (sameSession(this.savedSession, snapshot)) return this.getPublicState();
+    this.savedSession = snapshot;
+    await this.persistState();
+    this.pushLog("INFO", "Sessione desktop sincronizzata");
+    if (this.config.autoStart && !this.service.running) {
+      try {
+        await this.startService();
+      } catch (error) {
+        this.pushLog("WARN", `Auto-start non riuscito: ${normalizeError(error)}`);
+      }
+    }
+    return this.getPublicState();
+  }
+
+  async clearSession() {
+    this.savedSession = null;
+    this.authState.user = null;
+    this.authState.restaurant = null;
+    this.supabase = null;
+    await this.stopService();
+    await this.persistState();
+    this.pushLog("INFO", "Sessione desktop rimossa");
+    return this.getPublicState();
+  }
+
+  async startService() {
+    if (this.service.running) return this.getPublicState();
+    await this.ensureSignedIn();
+    if (!this.authState.restaurant?.id) {
+      throw new Error("Nessun ristorante associato all'account.");
+    }
+    this.service.running = true;
+    this.service.processing = false;
+    this.service.assignedPrinterId = null;
+    this.service.stats = {
+      claimed: 0,
+      printed: 0,
+      failed: 0,
+      lastRunAt: null,
+      lastError: null,
+    };
+    this.pushLog("INFO", `Servizio stampa avviato (${this.config.consumerId})`);
+    this.broadcastState();
+    void this.runTick();
+    return this.getPublicState();
+  }
+
+  async stopService() {
+    this.service.running = false;
+    this.service.processing = false;
+    if (this.service.timer) {
+      clearTimeout(this.service.timer);
+      this.service.timer = null;
+    }
+    try {
+      await this.heartbeatAgent(false);
+    } catch {
+      // ignore
+    }
+    this.pushLog("INFO", "Servizio stampa fermato");
+    this.broadcastState();
+    return this.getPublicState();
+  }
+
+  async discoverPrinters(timeoutMs?: number) {
+    return this.discoverNetworkPrinters(timeoutMs);
+  }
+
+  private pushLog(level: WorkerLogRow["level"], message: string) {
+    const entry: WorkerLogRow = { at: new Date().toISOString(), level, message };
+    this.logs.push(entry);
+    if (this.logs.length > LOG_CAP) this.logs.shift();
+    this.onMainLog?.(level, `[print-worker] ${message}`);
+    if (this.boundWindow && !this.boundWindow.isDestroyed()) {
+      this.boundWindow.webContents.send("desktop:printer-log", entry);
+    }
+  }
+
+  private broadcastState() {
+    if (this.boundWindow && !this.boundWindow.isDestroyed()) {
+      this.boundWindow.webContents.send("desktop:printer-state", this.getPublicState());
+    }
+  }
+
+  private async persistState() {
+    await fs.mkdir(path.dirname(this.configPath), { recursive: true });
+    await fs.writeFile(
+      this.configPath,
+      `${JSON.stringify({ config: this.config, session: this.savedSession }, null, 2)}\n`,
+      "utf8",
+    );
+  }
+
+  private async loadPersistedState() {
+    try {
+      const raw = await fs.readFile(this.configPath, "utf8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const savedConfig = (parsed.config && typeof parsed.config === "object"
+        ? parsed.config
+        : {}) as Record<string, unknown>;
+      this.config = {
+        consumerId: sanitizeConsumerId(savedConfig.consumerId ?? this.config.consumerId),
+        deviceName: sanitizeDeviceName(savedConfig.deviceName ?? this.config.deviceName),
+        pollMs: sanitizePollMs(savedConfig.pollMs ?? this.config.pollMs),
+        claimLimit: sanitizeClaimLimit(savedConfig.claimLimit ?? this.config.claimLimit),
+        autoStart: savedConfig.autoStart == null ? this.config.autoStart : Boolean(savedConfig.autoStart),
+      };
+      this.savedSession = toSessionSnapshot(parsed.session || null);
+    } catch {
+      // first run
+    }
+  }
+
+  private ensureSupabaseClient() {
+    const url = String(this.runtimeConfig.VITE_SUPABASE_URL || "").trim();
+    const anonKey = String(this.runtimeConfig.VITE_SUPABASE_ANON_KEY || "").trim();
+    if (!url || !anonKey) {
+      throw new Error("Config desktop Supabase non valida.");
+    }
+    if (!this.supabase) {
+      this.supabase = createClient(url, anonKey, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: true,
+          detectSessionInUrl: false,
+        },
+      });
+    }
+    return this.supabase;
+  }
+
+  private async ensureSignedIn() {
+    const client = this.ensureSupabaseClient();
+    const { data, error } = await client.auth.getUser();
+    if (!error && data?.user) {
+      this.authState.user = { id: data.user.id, email: data.user.email ?? null };
+      if (!this.authState.restaurant) {
+        this.authState.restaurant = await this.resolveRestaurantForCurrentUser(data.user.id);
+      }
+      return;
+    }
+
+    if (!this.savedSession) {
+      throw new Error("Sessione desktop assente: effettua login nell'app.");
+    }
+
+    const { data: restored, error: restoreError } = await client.auth.setSession({
+      access_token: this.savedSession.access_token,
+      refresh_token: this.savedSession.refresh_token,
+    });
+    if (restoreError || !restored?.user) {
+      throw restoreError || new Error("SESSION_INVALID");
+    }
+
+    this.authState.user = { id: restored.user.id, email: restored.user.email ?? null };
+    this.authState.restaurant = await this.resolveRestaurantForCurrentUser(restored.user.id);
+    const refreshedSnapshot = toSessionSnapshot(restored.session || null);
+    if (refreshedSnapshot && !sameSession(this.savedSession, refreshedSnapshot)) {
+      this.savedSession = refreshedSnapshot;
+      await this.persistState();
+    }
+  }
+
+  private async resolveRestaurantForCurrentUser(userId: string): Promise<RestaurantScope | null> {
+    const client = this.ensureSupabaseClient();
+
+    const { data: owned, error: ownerError } = await client
+      .from("restaurants")
+      .select("id,name,city")
+      .eq("owner_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (ownerError) throw ownerError;
+    if (owned?.id) {
+      return {
+        id: owned.id,
+        name: owned.name,
+        city: owned.city ?? null,
+        role: "owner",
+      };
+    }
+
+    const { data: roles, error: rolesError } = await client
+      .from("user_roles")
+      .select("role, restaurant_id, created_at")
+      .eq("user_id", userId)
+      .not("restaurant_id", "is", null)
+      .in("role", ["admin", "manager", "staff"]);
+    if (rolesError) throw rolesError;
+
+    const rankedRows = (roles || [])
+      .map((row) => ({
+        role: row.role as RestaurantScope["role"],
+        restaurant_id: String(row.restaurant_id || ""),
+        created_at: String(row.created_at || ""),
+      }))
+      .filter((row) => Boolean(row.role) && Boolean(row.restaurant_id))
+      .sort((a, b) => {
+        const roleDelta = (roleRank[a.role] || 99) - (roleRank[b.role] || 99);
+        if (roleDelta !== 0) return roleDelta;
+        return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+      });
+
+    const best = rankedRows[0];
+    if (!best) return null;
+
+    const { data: roleRestaurant, error: restaurantError } = await client
+      .from("restaurants")
+      .select("id,name,city")
+      .eq("id", best.restaurant_id)
+      .maybeSingle();
+    if (restaurantError) throw restaurantError;
+    if (!roleRestaurant?.id) return null;
+
+    return {
+      id: roleRestaurant.id,
+      name: roleRestaurant.name,
+      city: roleRestaurant.city ?? null,
+      role: best.role,
+    };
+  }
+
+  private async fetchAssignedPrinterId() {
+    if (!this.authState.restaurant?.id) return null;
+    const client = this.ensureSupabaseClient();
+    const { data, error } = await client.rpc("printing_list_agents", {
+      p_restaurant_id: this.authState.restaurant.id,
+    });
+    if (error) throw error;
+    const rows = Array.isArray(data) ? data : [];
+    const current = rows.find((row) => String((row as Record<string, unknown>).agent_id || "").trim() === this.config.consumerId);
+    return String((current as Record<string, unknown> | undefined)?.printer_id || "").trim() || null;
+  }
+
+  private async heartbeatAgent(isActive: boolean) {
+    if (!this.authState.restaurant?.id) return;
+    try {
+      const client = this.ensureSupabaseClient();
+      let serverAssigned: string | null = null;
+      try {
+        serverAssigned = await this.fetchAssignedPrinterId();
+      } catch (error) {
+        this.pushLog("WARN", `Lettura assegnazione agente fallita: ${normalizeError(error)}`);
+      }
+
+      const { data, error } = await client.rpc("printing_register_agent", {
+        p_restaurant_id: this.authState.restaurant.id,
+        p_agent_id: this.config.consumerId,
+        p_printer_id: serverAssigned || this.service.assignedPrinterId || null,
+        p_device_name: this.config.deviceName,
+        p_app_version: this.appVersion,
+        p_is_active: isActive,
+      });
+      if (error) throw error;
+      const nextAssigned =
+        String((data as Record<string, unknown> | null)?.printer_id || "").trim() || serverAssigned || null;
+      if (this.service.assignedPrinterId !== nextAssigned) {
+        this.service.assignedPrinterId = nextAssigned;
+        this.broadcastState();
+      }
+    } catch (error) {
+      this.pushLog("WARN", `Heartbeat agente fallito: ${normalizeError(error)}`);
+    }
+  }
+
+  private async fetchLivePrinterRoutes(restaurantId: string): Promise<LiveRoutes> {
+    const client = this.ensureSupabaseClient();
+    const { data, error } = await client
+      .from("restaurants")
+      .select("settings")
+      .eq("id", restaurantId)
+      .maybeSingle();
+    if (error) throw error;
+    const settings = (data?.settings && typeof data.settings === "object" ? data.settings : {}) as Record<string, unknown>;
+    const printing =
+      settings.printing && typeof settings.printing === "object" ? (settings.printing as Record<string, unknown>) : {};
+    const printersRaw = Array.isArray(printing.printers) ? printing.printers : [];
+    const byId = new Map<string, LivePrinter>();
+    const byDepartment = new Map<string, LivePrinter>();
+
+    for (const rawPrinter of printersRaw) {
+      const printer = (rawPrinter && typeof rawPrinter === "object" ? rawPrinter : {}) as Record<string, unknown>;
+      const id = String(printer.id || "").trim();
+      if (!id) continue;
+      const mapped: LivePrinter = {
+        id,
+        name: String(printer.name || "").trim() || id,
+        host: String(printer.host || "").trim(),
+        port: sanitizePrinterPort(printer.port),
+        enabled: printer.enabled !== false,
+        departments: Array.isArray(printer.departments)
+          ? printer.departments.map((entry) => normalizeDepartment(entry)).filter(Boolean)
+          : [],
+      };
+      byId.set(id, mapped);
+      if (mapped.enabled && mapped.host) {
+        for (const dep of mapped.departments) {
+          if (!byDepartment.has(dep)) byDepartment.set(dep, mapped);
+        }
+      }
+    }
+
+    return {
+      byId,
+      byDepartment,
+      defaultPrinterId: String(printing.default_printer_id || "").trim() || null,
+    };
+  }
+
+  private resolveRouteForJob(job: JobRow, liveRoutes: LiveRoutes | null) {
+    const snapshotRoute = (job.route && typeof job.route === "object" ? job.route : {}) as Record<string, unknown>;
+    const snapshotId = String(snapshotRoute.id || snapshotRoute.printer_id || "").trim() || null;
+    const snapshotHost = String(snapshotRoute.host || "").trim();
+    const snapshotPort = sanitizePrinterPort(snapshotRoute.port);
+    const dep = normalizeDepartment(job.department);
+
+    if (liveRoutes?.byId && snapshotId) {
+      const live = liveRoutes.byId.get(snapshotId);
+      if (live && live.enabled && live.host) {
+        return { id: live.id, name: live.name, host: live.host, port: live.port };
+      }
+    }
+    if (liveRoutes?.byDepartment) {
+      const byDep = liveRoutes.byDepartment.get(dep);
+      if (byDep && byDep.enabled && byDep.host) {
+        return { id: byDep.id, name: byDep.name, host: byDep.host, port: byDep.port };
+      }
+    }
+    if (liveRoutes?.byId && liveRoutes.defaultPrinterId) {
+      const fallback = liveRoutes.byId.get(liveRoutes.defaultPrinterId);
+      if (fallback && fallback.enabled && fallback.host) {
+        return { id: fallback.id, name: fallback.name, host: fallback.host, port: fallback.port };
+      }
+    }
+    if (snapshotHost) {
+      return {
+        id: snapshotId,
+        name: String(snapshotRoute.name || snapshotId || snapshotHost),
+        host: snapshotHost,
+        port: snapshotPort,
+      };
+    }
+    return null;
+  }
+
+  private async sendToPrinter(job: JobRow, routeOverride: { host: string; port: number } | null) {
+    const host = String(routeOverride?.host || "").trim();
+    const port = sanitizePrinterPort(routeOverride?.port);
+    if (!host) throw new Error("NO_PRINTER_HOST");
+    const payload = buildEscPosPayload(renderTicket(job));
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        await openRawSocket(host, port, payload);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt >= 2 || !shouldRetryPrintLocally(error)) break;
+        await sleep(500);
+      }
+    }
+    throw new Error(`${normalizeError(lastError)} (target ${host}:${port})`);
+  }
+
+  private async completeJob(job: JobRow, success: boolean, errorMessage: string | null) {
+    const client = this.ensureSupabaseClient();
+    const { error } = await client.rpc("print_complete_job", {
+      p_job_id: job.id,
+      p_consumer_id: this.config.consumerId,
+      p_success: success,
+      p_error: success ? null : String(errorMessage || "PRINT_FAILED").slice(0, 500),
+      p_meta: {
+        source: "desktop_all_in_one",
+        device_name: this.config.deviceName,
+        app_version: this.appVersion,
+      },
+    });
+    if (error) throw error;
+  }
+
+  private async runTick() {
+    if (!this.service.running || this.service.processing) return;
+    this.service.processing = true;
+    this.broadcastState();
+    try {
+      await this.ensureSignedIn();
+      if (!this.authState.restaurant?.id) throw new Error("Ristorante non risolto.");
+      await this.heartbeatAgent(true);
+      const client = this.ensureSupabaseClient();
+      const { data, error } = await client.rpc("print_claim_jobs", {
+        p_restaurant_id: this.authState.restaurant.id,
+        p_consumer_id: this.config.consumerId,
+        p_limit: this.config.claimLimit,
+      });
+      if (error) throw error;
+      const jobs = (Array.isArray(data) ? data : []) as JobRow[];
+      this.service.stats.claimed += jobs.length;
+      if (jobs.length > 0) this.pushLog("INFO", `Claimati ${jobs.length} job`);
+
+      let liveRoutes: LiveRoutes | null = null;
+      try {
+        liveRoutes = await this.fetchLivePrinterRoutes(this.authState.restaurant.id);
+      } catch (routesError) {
+        this.pushLog("WARN", `Risoluzione route live fallita: ${normalizeError(routesError)}`);
+      }
+
+      for (const job of jobs) {
+        try {
+          const route = this.resolveRouteForJob(job, liveRoutes);
+          await this.sendToPrinter(job, route);
+          await this.completeJob(job, true, null);
+          this.service.stats.printed += 1;
+          this.pushLog("INFO", `Stampato job ${String(job.id).slice(0, 8)} -> ${normalizeDepartment(job.department)}`);
+        } catch (jobError) {
+          const message = normalizeError(jobError);
+          try {
+            await this.completeJob(job, false, message);
+          } catch (ackError) {
+            this.pushLog("ERROR", `Ack failed job ${String(job.id).slice(0, 8)}: ${normalizeError(ackError)}`);
+          }
+          this.service.stats.failed += 1;
+          this.pushLog("ERROR", `Errore job ${String(job.id).slice(0, 8)}: ${message}`);
+        }
+      }
+      this.service.stats.lastRunAt = new Date().toISOString();
+      this.service.stats.lastError = null;
+    } catch (error) {
+      const message = normalizeError(error);
+      this.service.stats.lastError = message;
+      this.pushLog("ERROR", `Tick error: ${message}`);
+    } finally {
+      this.service.processing = false;
+      this.broadcastState();
+      if (this.service.running) {
+        this.service.timer = setTimeout(() => {
+          void this.runTick();
+        }, this.config.pollMs);
+      }
+    }
+  }
+
+  private async discoverNetworkPrinters(timeoutMs?: number) {
+    const safeTimeout = Number.isFinite(Number(timeoutMs))
+      ? Math.max(DISCOVERY_TIMEOUT_MIN, Math.min(DISCOVERY_TIMEOUT_MAX, Math.trunc(Number(timeoutMs))))
+      : DISCOVERY_TIMEOUT_DEFAULT;
+    const targets = collectLanTargets();
+    const printers: DiscoverPrinter[] = [];
+
+    await runWithConcurrency(targets, DISCOVERY_CONCURRENCY, async (target) => {
+      let openPort: number | null = null;
+      for (const port of DISCOVERY_PORTS) {
+        const isOpen = await probeTcpPort(target.host, port, safeTimeout);
+        if (isOpen) {
+          openPort = port;
+          break;
+        }
+      }
+      if (openPort == null) return;
+      printers.push({
+        host: target.host,
+        port: openPort,
+        connection_type: target.connectionType,
+        interface_name: target.interfaceName,
+        interface_ip: target.interfaceIp,
+        source: "lan_scan",
+        label: `Network printer ${target.host}`,
+      });
+    });
+
+    printers.sort((a, b) => a.host.localeCompare(b.host, "en", { numeric: true, sensitivity: "base" }));
+    return {
+      ok: true as const,
+      generated_at: new Date().toISOString(),
+      scanned_hosts: targets.length,
+      timeout_ms: safeTimeout,
+      scanned_ports: [...DISCOVERY_PORTS],
+      printers,
+    };
+  }
+}

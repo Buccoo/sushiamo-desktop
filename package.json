@@ -1,0 +1,69 @@
+{
+  "name": "sushiamo-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "electron-dist/main.cjs",
+  "scripts": {
+    "prepare-config": "node scripts/desktop/generate-runtime-config.mjs",
+    "build:ts": "node scripts/desktop/build-electron.mjs",
+    "watch:ts": "node scripts/desktop/build-electron.mjs --watch",
+    "build:win": "npm run prepare-config && npm run build:ts && electron-builder --win nsis --publish never",
+    "build:mac": "npm run prepare-config && npm run build:ts && electron-builder --mac dmg --x64 --arm64 --publish never",
+    "build:mac:arm64": "npm run prepare-config && npm run build:ts && electron-builder --mac dmg --arm64 --publish never",
+    "build:mac:x64": "npm run prepare-config && npm run build:ts && electron-builder --mac dmg --x64 --publish never",
+    "dev": "npm run prepare-config && concurrently -k -n TS,ELECTRON \"npm run watch:ts\" \"wait-on electron-dist/main.cjs && cross-env ELECTRON_DEV_SERVER_URL=https://business.sushiamo.app node scripts/desktop/run-electron-dev.mjs\""
+  },
+  "build": {
+    "appId": "online.tattica.sushiamo.desktop",
+    "productName": "SushiAMO Desktop",
+    "asar": true,
+    "compression": "maximum",
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "electron-dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/runtime-config.json",
+        "to": "desktop-runtime-config.json"
+      }
+    ],
+    "win": {
+      "target": ["nsis"],
+      "icon": "assets/favicon.png",
+      "artifactName": "SushiAMO-Desktop-Setup.${ext}"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "icon": "assets/favicon.png",
+      "artifactName": "SushiAMO-Desktop-macOS-${arch}.${ext}",
+      "category": "public.app-category.business",
+      "identity": null,
+      "hardenedRuntime": false
+    },
+    "protocols": [
+      {
+        "name": "SushiAMO Deep Link",
+        "schemes": ["sushiamo"]
+      }
+    ]
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.94.0",
+    "electron-updater": "^6.7.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.16.5",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^40.4.1",
+    "electron-builder": "^26.7.0",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.8.3",
+    "wait-on": "^9.0.4"
+  }
+}

@@ -1,0 +1,89 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows
+        run: npm run build:win
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL }}
+          SUSHIAMO_DESKTOP_UPDATE_URL: ${{ vars.DESKTOP_UPDATE_URL }}
+          SUSHIAMO_DESKTOP_ENABLE_AUTO_UPDATE: "1"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: |
+            dist-desktop/*.exe
+            dist-desktop/*.yml
+            dist-desktop/*.blockmap
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build macOS
+        run: npm run build:mac
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL }}
+          SUSHIAMO_DESKTOP_UPDATE_URL: ${{ vars.DESKTOP_UPDATE_URL }}
+          SUSHIAMO_DESKTOP_ENABLE_AUTO_UPDATE: "1"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-build
+          path: |
+            dist-desktop/*.dmg
+            dist-desktop/*.yml
+            dist-desktop/*.blockmap
+
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

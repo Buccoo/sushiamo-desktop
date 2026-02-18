@@ -1,0 +1,8 @@
+{
+  "VITE_SUPABASE_URL": "YOUR_SUPABASE_URL",
+  "VITE_SUPABASE_ANON_KEY": "YOUR_SUPABASE_ANON_KEY",
+  "VITE_ROUTER_MODE": "hash",
+  "SUSHIAMO_DESKTOP_ENABLE_AUTO_UPDATE": "1",
+  "SUSHIAMO_DESKTOP_UPDATE_URL": "https://github.com/Buccoo/sushiamo-desktop/releases/latest/download",
+  "PUBLIC_APP_URL": "https://business.sushiamo.app"
+}

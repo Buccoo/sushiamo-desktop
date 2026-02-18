@@ -1,0 +1,8 @@
+node_modules/
+electron-dist/
+dist-desktop/
+.env
+.env.local
+.env.desktop
+.env.desktop.local
+electron/runtime-config.json
