@@ -48,6 +48,13 @@ jobs:
       - name: Install desktop dependencies
         run: npm ci
 
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version
+
       - name: Build Electron
         run: npm run prepare-config && npm run build:ts
         env:
@@ -103,6 +110,12 @@ jobs:
 
       - name: Install desktop dependencies
         run: npm ci
+
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version
 
       - name: Build Electron
         run: npm run prepare-config && npm run build:ts
