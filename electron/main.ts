@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, shell } from "electron";
 import { autoUpdater } from "electron-updater";
 import fs from "node:fs";
 import path from "node:path";
@@ -364,6 +364,97 @@ function setupDevShortcuts(win: BrowserWindow) {
   });
 }
 
+function setupApplicationMenu() {
+  const appVersion = app.getVersion();
+  const isMac = process.platform === "darwin";
+
+  const checkForUpdatesItem: Electron.MenuItemConstructorOptions = {
+    label: "Controlla aggiornamenti",
+    click: async () => {
+      if (!desktopAutoUpdateEnabled) {
+        await shell.openExternal("https://github.com/Buccoo/sushiamo-desktop/releases/latest");
+        return;
+      }
+      try {
+        desktopUpdateCheckInProgress = true;
+        await autoUpdater.checkForUpdates();
+      } catch (error) {
+        desktopUpdateCheckInProgress = false;
+        log("WARN", "menu: check for updates failed", error instanceof Error ? error.message : String(error));
+      }
+    },
+  };
+
+  const openLogFolderItem: Electron.MenuItemConstructorOptions = {
+    label: "Apri cartella log",
+    click: async () => {
+      const logPath = getLogFilePath();
+      if (logPath) {
+        await shell.openPath(path.dirname(logPath));
+      }
+    },
+  };
+
+  const sendLogsItem: Electron.MenuItemConstructorOptions = {
+    label: "Invia log al supporto...",
+    click: async () => {
+      const logPath = getLogFilePath() || "non disponibile";
+      const subject = encodeURIComponent(`[SushiAMO Desktop v${appVersion}] Segnalazione problema`);
+      const body = encodeURIComponent(
+        `Salve,\n\nDescrivi qui il problema riscontrato:\n\n\n---\nVersione app: ${appVersion}\nSistema: ${process.platform} ${process.arch}\nFile di log: ${logPath}\n\nAllega il file di log alla email (aprilo con "Apri cartella log" dal menu Aiuto).`,
+      );
+      await shell.openExternal(`mailto:sviluppo@sushiamo.app?subject=${subject}&body=${body}`);
+    },
+  };
+
+  const template: Electron.MenuItemConstructorOptions[] = [
+    ...(isMac
+      ? [
+          {
+            label: app.getName(),
+            submenu: [
+              { label: `Versione ${appVersion}`, enabled: false },
+              { type: "separator" as const },
+              checkForUpdatesItem,
+              { type: "separator" as const },
+              { role: "hide" as const },
+              { role: "hideOthers" as const },
+              { role: "unhide" as const },
+              { type: "separator" as const },
+              { role: "quit" as const },
+            ],
+          },
+        ]
+      : []),
+    {
+      label: "App",
+      submenu: [
+        { label: `SushiAMO Desktop v${appVersion}`, enabled: false },
+        { type: "separator" as const },
+        ...(!isMac ? [checkForUpdatesItem, { type: "separator" as const }] : []),
+        { role: "quit" as const, label: "Esci" },
+      ],
+    },
+    {
+      label: "Aiuto",
+      submenu: [
+        openLogFolderItem,
+        sendLogsItem,
+        { type: "separator" as const },
+        {
+          label: "Documentazione online",
+          click: async () => {
+            await shell.openExternal("https://sushiamo.app/gestionale");
+          },
+        },
+      ],
+    },
+  ];
+
+  const menu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(menu);
+}
+
 function setupAutoUpdaterScaffold() {
   desktopAutoUpdateEnabled =
     String(runtimeConfig.SUSHIAMO_DESKTOP_ENABLE_AUTO_UPDATE || "0") === "1" && app.isPackaged;
@@ -451,7 +542,11 @@ async function loadRendererWithRetry(win: BrowserWindow) {
   if (!DEV_SERVER_URL) {
     const publicAppUrl = runtimeConfig.PUBLIC_APP_URL;
     if (publicAppUrl) {
-      await win.loadURL(publicAppUrl);
+      try {
+        await win.loadURL(publicAppUrl);
+      } catch {
+        // did-fail-load event already handles showing the error fallback page
+      }
     } else {
       await win.loadFile(path.join(app.getAppPath(), "dist", "index.html"));
     }
@@ -483,7 +578,7 @@ async function createMainWindow() {
     minWidth: 1080,
     minHeight: 720,
     icon: windowIcon,
-    autoHideMenuBar: true,
+    autoHideMenuBar: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       nodeIntegration: false,
@@ -591,6 +686,7 @@ app
 
     registerProtocolHandler();
     setupAutoUpdaterScaffold();
+    setupApplicationMenu();
     printWorker = new DesktopPrintWorker({
       runtimeConfig: {
         VITE_SUPABASE_URL: runtimeConfig.VITE_SUPABASE_URL,
