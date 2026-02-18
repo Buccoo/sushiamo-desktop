@@ -13,24 +13,51 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout sushiamo-desktop
+        uses: actions/checkout@v4
+
+      - name: Checkout sushiamo (webapp source)
+        uses: actions/checkout@v4
+        with:
+          repository: Buccoo/sushiamo
+          token: ${{ secrets.GH_PAT }}
+          path: sushiamo-src
 
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: "npm"
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
 
-      - name: Build Windows
-        run: npm run build:win
+      - name: Install webapp dependencies
+        working-directory: sushiamo-src
+        run: bun install
+
+      - name: Build webapp (desktop mode)
+        working-directory: sushiamo-src
+        run: bunx cross-env VITE_ROUTER_MODE=hash vite build --mode desktop
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-          PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL }}
+
+      - name: Copy dist to desktop repo
+        shell: bash
+        run: cp -r sushiamo-src/dist ./dist
+
+      - name: Install desktop dependencies
+        run: npm ci
+
+      - name: Build Electron
+        run: npm run prepare-config && npm run build:ts
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
           SUSHIAMO_DESKTOP_UPDATE_URL: ${{ vars.DESKTOP_UPDATE_URL }}
           SUSHIAMO_DESKTOP_ENABLE_AUTO_UPDATE: "1"
+
+      - name: Package Windows
+        run: electron-builder --win nsis --publish never
 
       - uses: actions/upload-artifact@v4
         with:
@@ -43,24 +70,50 @@ jobs:
   build-mac:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout sushiamo-desktop
+        uses: actions/checkout@v4
+
+      - name: Checkout sushiamo (webapp source)
+        uses: actions/checkout@v4
+        with:
+          repository: Buccoo/sushiamo
+          token: ${{ secrets.GH_PAT }}
+          path: sushiamo-src
 
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: "npm"
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
 
-      - name: Build macOS
-        run: npm run build:mac
+      - name: Install webapp dependencies
+        working-directory: sushiamo-src
+        run: bun install
+
+      - name: Build webapp (desktop mode)
+        working-directory: sushiamo-src
+        run: bunx cross-env VITE_ROUTER_MODE=hash vite build --mode desktop
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-          PUBLIC_APP_URL: ${{ vars.PUBLIC_APP_URL }}
+
+      - name: Copy dist to desktop repo
+        run: cp -r sushiamo-src/dist ./dist
+
+      - name: Install desktop dependencies
+        run: npm ci
+
+      - name: Build Electron
+        run: npm run prepare-config && npm run build:ts
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
           SUSHIAMO_DESKTOP_UPDATE_URL: ${{ vars.DESKTOP_UPDATE_URL }}
           SUSHIAMO_DESKTOP_ENABLE_AUTO_UPDATE: "1"
+
+      - name: Package macOS
+        run: electron-builder --mac dmg --x64 --arm64 --publish never
 
       - uses: actions/upload-artifact@v4
         with:

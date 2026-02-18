@@ -23,6 +23,7 @@
       "output": "dist-desktop"
     },
     "files": [
+      "dist/**/*",
       "electron-dist/**/*",
       "package.json"
     ],
