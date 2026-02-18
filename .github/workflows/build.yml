@@ -57,7 +57,7 @@ jobs:
           SUSHIAMO_DESKTOP_ENABLE_AUTO_UPDATE: "1"
 
       - name: Package Windows
-        run: electron-builder --win nsis --publish never
+        run: npx electron-builder --win nsis --publish never
 
       - uses: actions/upload-artifact@v4
         with:
@@ -113,7 +113,7 @@ jobs:
           SUSHIAMO_DESKTOP_ENABLE_AUTO_UPDATE: "1"
 
       - name: Package macOS
-        run: electron-builder --mac dmg --x64 --arm64 --publish never
+        run: npx electron-builder --mac dmg --x64 --arm64 --publish never
 
       - uses: actions/upload-artifact@v4
         with:
