@@ -45,6 +45,12 @@ type JobRow = {
   created_at: string;
 };
 
+type PhysicalReceiptJobRow = {
+  id: string;
+  payload: Record<string, unknown> | null;
+  created_at: string;
+};
+
 type LivePrinter = {
   id: string;
   name: string;
@@ -125,6 +131,19 @@ function normalizeError(error: unknown) {
   }
 }
 
+function isMissingRpcError(error: unknown, rpcName: string) {
+  const message = normalizeError(error).toLowerCase();
+  const needle = String(rpcName || "").trim().toLowerCase();
+  if (!needle) return false;
+  return (
+    message.includes(needle) &&
+    (message.includes("schema cache") ||
+      message.includes("could not find") ||
+      message.includes("does not exist") ||
+      message.includes("not found"))
+  );
+}
+
 function sanitizeConsumerId(value: unknown) {
   const raw = String(value ?? "")
     .trim()
@@ -166,6 +185,76 @@ function sanitizePrinterPort(value: unknown) {
   if (!Number.isFinite(n)) return 9100;
   const port = Math.trunc(n);
   return port >= 1 && port <= 65535 ? port : 9100;
+}
+
+function normalizePhysicalBrand(value: unknown) {
+  const brand = String(value ?? "").trim().toLowerCase();
+  return brand || "epson";
+}
+
+function sanitizePhysicalPort(value: unknown, brand: string) {
+  const parsed = Number(value);
+  if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) return parsed;
+  return brand === "epson" ? 8008 : 9100;
+}
+
+function sanitizePhysicalPath(value: unknown) {
+  const pathValue = String(value ?? "").trim();
+  if (!pathValue) return "/cgi-bin/fpmate.cgi";
+  return pathValue.startsWith("/") ? pathValue : `/${pathValue}`;
+}
+
+function normalizePaymentMethod(value: unknown) {
+  const method = String(value ?? "").trim().toLowerCase();
+  return method === "card" ? "card" : "cash";
+}
+
+function toCents(value: unknown) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  return Math.max(0, Math.round(amount * 100));
+}
+
+function escapeXml(value: unknown) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function buildEpsonFiscalReceiptXml(payload: Record<string, unknown>) {
+  const tableNumber = String(payload?.table_number ?? "").trim() || "-";
+  const paymentMethod = normalizePaymentMethod(payload?.payment_method);
+  const paymentLabel = paymentMethod === "card" ? "ELETTRONICO" : "CONTANTI";
+  const cents = Math.max(1, toCents(payload?.total_amount));
+  const description = `Sushiamo Tavolo ${tableNumber}`;
+
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<FPMessage>\n` +
+    `  <beginFiscalReceipt operator="1"/>\n` +
+    `  <printRecItem description="${escapeXml(description)}" price="${cents}" quantity="1" department="1" vatCode="1"/>\n` +
+    `  <printRecTotal description="${paymentLabel}" payment="${cents}"/>\n` +
+    `  <endFiscalReceipt/>\n` +
+    `</FPMessage>`
+  );
+}
+
+function extractReceiptIdFromResponse(responseText: string) {
+  const text = String(responseText || "");
+  if (!text) return null;
+  const patterns = [
+    /receipt[_\s-]?id["'\s:=]+([A-Za-z0-9._:/-]+)/i,
+    /document[_\s-]?number["'\s:=]+([A-Za-z0-9._:/-]+)/i,
+    /progressive[_\s-]?number["'\s:=]+([A-Za-z0-9._:/-]+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return match[1].trim();
+  }
+  return null;
 }
 
 function normalizeDepartment(value: unknown) {
@@ -457,6 +546,7 @@ export class DesktopPrintWorker {
   };
   private savedSession: SessionSnapshot | null = null;
   private supabase: SupabaseClient | null = null;
+  private physicalReceiptRpcAvailable = true;
   private boundWindow: BrowserWindow | null = null;
   private service = {
     running: false,
@@ -575,6 +665,7 @@ export class DesktopPrintWorker {
       lastRunAt: null,
       lastError: null,
     };
+    this.physicalReceiptRpcAvailable = true;
     this.pushLog("INFO", `Servizio stampa avviato (${this.config.consumerId})`);
     this.broadcastState();
     void this.runTick();
@@ -899,13 +990,90 @@ export class DesktopPrintWorker {
     throw new Error(`${normalizeError(lastError)} (target ${host}:${port})`);
   }
 
-  private async completeJob(job: JobRow, success: boolean, errorMessage: string | null) {
+  private async completePrintJob(job: JobRow, success: boolean, errorMessage: string | null) {
     const client = this.ensureSupabaseClient();
     const { error } = await client.rpc("print_complete_job", {
       p_job_id: job.id,
       p_consumer_id: this.config.consumerId,
       p_success: success,
       p_error: success ? null : String(errorMessage || "PRINT_FAILED").slice(0, 500),
+      p_meta: {
+        source: "desktop_all_in_one",
+        device_name: this.config.deviceName,
+        app_version: this.appVersion,
+      },
+    });
+    if (error) throw error;
+  }
+
+  private async postPhysicalReceipt(route: Record<string, unknown>, payload: Record<string, unknown>) {
+    const host = String(route.host ?? "").trim();
+    const brand = normalizePhysicalBrand(route.brand);
+    const port = sanitizePhysicalPort(route.port, brand);
+    const apiPath = sanitizePhysicalPath(route.api_path);
+    if (!host) throw new Error("PHYSICAL_RT_HOST_MISSING");
+
+    const endpoint = `http://${host}:${port}${apiPath}`;
+    const body = buildEpsonFiscalReceiptXml(payload);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/xml; charset=utf-8",
+        },
+        body,
+        signal: controller.signal,
+      });
+      const responseText = await response.text().catch(() => "");
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${responseText || "RT response error"}`);
+      }
+      if (/\b(error|fault|ko)\b/i.test(responseText)) {
+        throw new Error(responseText.slice(0, 500) || "RT_ERROR_RESPONSE");
+      }
+      return extractReceiptIdFromResponse(responseText);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async sendToPhysicalReceiptDevice(job: PhysicalReceiptJobRow) {
+    const payload = (job.payload && typeof job.payload === "object" ? job.payload : {}) as Record<string, unknown>;
+    const route = (payload.route && typeof payload.route === "object" ? payload.route : {}) as Record<string, unknown>;
+
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const receiptId = await this.postPhysicalReceipt(route, payload);
+        return receiptId || `RT-${String(job.id || "").slice(0, 8)}-${Date.now()}`;
+      } catch (error) {
+        lastError = error;
+        if (attempt >= 2 || !shouldRetryPrintLocally(error)) break;
+        await sleep(500);
+      }
+    }
+
+    const host = String(route.host ?? "").trim() || "n/a";
+    const brand = normalizePhysicalBrand(route.brand);
+    const port = sanitizePhysicalPort(route.port, brand);
+    throw new Error(`${normalizeError(lastError)} (target ${host}:${port})`);
+  }
+
+  private async completePhysicalReceiptJob(
+    job: PhysicalReceiptJobRow,
+    success: boolean,
+    options: { receiptId?: string | null; error?: string | null } = {},
+  ) {
+    const client = this.ensureSupabaseClient();
+    const { error } = await client.rpc("physical_receipt_complete_job", {
+      p_job_id: job.id,
+      p_consumer_id: this.config.consumerId,
+      p_success: success,
+      p_receipt_id: success ? String(options.receiptId || "").trim() || null : null,
+      p_error: success ? null : String(options.error || "PHYSICAL_RECEIPT_FAILED").slice(0, 500),
       p_meta: {
         source: "desktop_all_in_one",
         device_name: this.config.deviceName,
@@ -945,13 +1113,13 @@ export class DesktopPrintWorker {
         try {
           const route = this.resolveRouteForJob(job, liveRoutes);
           await this.sendToPrinter(job, route);
-          await this.completeJob(job, true, null);
+          await this.completePrintJob(job, true, null);
           this.service.stats.printed += 1;
           this.pushLog("INFO", `Stampato job ${String(job.id).slice(0, 8)} -> ${normalizeDepartment(job.department)}`);
         } catch (jobError) {
           const message = normalizeError(jobError);
           try {
-            await this.completeJob(job, false, message);
+            await this.completePrintJob(job, false, message);
           } catch (ackError) {
             this.pushLog("ERROR", `Ack failed job ${String(job.id).slice(0, 8)}: ${normalizeError(ackError)}`);
           }
@@ -959,6 +1127,57 @@ export class DesktopPrintWorker {
           this.pushLog("ERROR", `Errore job ${String(job.id).slice(0, 8)}: ${message}`);
         }
       }
+
+      if (this.physicalReceiptRpcAvailable) {
+        try {
+          const { data: physicalData, error: physicalError } = await client.rpc("physical_receipt_claim_jobs", {
+            p_restaurant_id: this.authState.restaurant.id,
+            p_consumer_id: this.config.consumerId,
+            p_limit: this.config.claimLimit,
+          });
+
+          if (physicalError) {
+            if (isMissingRpcError(physicalError, "physical_receipt_claim_jobs")) {
+              this.physicalReceiptRpcAvailable = false;
+              this.pushLog("WARN", "RPC physical_receipt_claim_jobs non trovata: applica la migrazione RT fisico.");
+            } else {
+              throw physicalError;
+            }
+          } else {
+            const physicalJobs = (Array.isArray(physicalData) ? physicalData : []) as PhysicalReceiptJobRow[];
+            this.service.stats.claimed += physicalJobs.length;
+            if (physicalJobs.length > 0) {
+              this.pushLog("INFO", `Claimati ${physicalJobs.length} job RT fisico`);
+            }
+
+            for (const job of physicalJobs) {
+              try {
+                const receiptId = await this.sendToPhysicalReceiptDevice(job);
+                await this.completePhysicalReceiptJob(job, true, { receiptId });
+                this.service.stats.printed += 1;
+                this.pushLog("INFO", `Emesso scontrino RT job ${String(job.id).slice(0, 8)}`);
+              } catch (jobError) {
+                const message = normalizeError(jobError);
+                try {
+                  await this.completePhysicalReceiptJob(job, false, { error: message });
+                } catch (ackError) {
+                  if (isMissingRpcError(ackError, "physical_receipt_complete_job")) {
+                    this.physicalReceiptRpcAvailable = false;
+                    this.pushLog("WARN", "RPC physical_receipt_complete_job non trovata: applica la migrazione RT fisico.");
+                  } else {
+                    this.pushLog("ERROR", `Ack failed RT job ${String(job.id).slice(0, 8)}: ${normalizeError(ackError)}`);
+                  }
+                }
+                this.service.stats.failed += 1;
+                this.pushLog("ERROR", `Errore RT job ${String(job.id).slice(0, 8)}: ${message}`);
+              }
+            }
+          }
+        } catch (physicalTickError) {
+          this.pushLog("ERROR", `Tick RT fisico: ${normalizeError(physicalTickError)}`);
+        }
+      }
+
       this.service.stats.lastRunAt = new Date().toISOString();
       this.service.stats.lastError = null;
     } catch (error) {

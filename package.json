@@ -1,6 +1,6 @@
 {
   "name": "sushiamo-desktop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "main": "electron-dist/main.cjs",
@@ -33,12 +33,16 @@
       }
     ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "icon": "assets/favicon.png",
       "artifactName": "SushiAMO-Desktop-Setup.${ext}"
     },
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "icon": "assets/favicon.png",
       "artifactName": "SushiAMO-Desktop-macOS-${arch}.${ext}",
       "category": "public.app-category.business",
@@ -48,7 +52,9 @@
     "protocols": [
       {
         "name": "SushiAMO Deep Link",
-        "schemes": ["sushiamo"]
+        "schemes": [
+          "sushiamo"
+        ]
       }
     ]
   },
