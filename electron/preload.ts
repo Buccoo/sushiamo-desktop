@@ -109,6 +109,10 @@ contextBridge.exposeInMainWorld("desktopShell", {
   getRuntimeConfig: () => ({ ...runtimeConfig }),
   getDebugInfo: () => ipcRenderer.invoke("desktop:get-debug-info"),
   openLogFolder: () => ipcRenderer.invoke("desktop:open-log-folder"),
+  getSavedCredentials: () => ipcRenderer.invoke("desktop:credentials:get"),
+  saveCredentials: (payload: { email?: unknown; password?: unknown }) =>
+    ipcRenderer.invoke("desktop:credentials:set", payload || {}),
+  clearSavedCredentials: () => ipcRenderer.invoke("desktop:credentials:clear"),
   getUpdateState: () => ipcRenderer.invoke("desktop:get-update-state"),
   checkForUpdates: () => ipcRenderer.invoke("desktop:check-for-updates"),
   downloadUpdate: () => ipcRenderer.invoke("desktop:download-update"),
@@ -123,6 +127,11 @@ contextBridge.exposeInMainWorld("desktopShell", {
     discover: (timeoutMs?: number) =>
       ipcRenderer.invoke(
         "desktop:printer:discover",
+        Number.isFinite(Number(timeoutMs)) ? { timeoutMs: Number(timeoutMs) } : {},
+      ),
+    discoverRt: (timeoutMs?: number) =>
+      ipcRenderer.invoke(
+        "desktop:printer:discover-rt",
         Number.isFinite(Number(timeoutMs)) ? { timeoutMs: Number(timeoutMs) } : {},
       ),
     onState: (callback: (state: unknown) => void) => {

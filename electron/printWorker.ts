@@ -76,6 +76,18 @@ type DiscoverPrinter = {
   label: string;
 };
 
+type DiscoverRtDevice = {
+  host: string;
+  port: number;
+  brand: "epson" | "custom" | "axon" | "rch" | "olivetti" | "other";
+  api_path: string;
+  connection_type: "ethernet" | "wifi" | "unknown";
+  interface_name: string | null;
+  interface_ip: string | null;
+  source: "lan_scan";
+  label: string;
+};
+
 type WorkerPublicState = {
   config: WorkerConfig;
   auth: {
@@ -106,6 +118,7 @@ type PrintWorkerDeps = {
 
 const CONFIG_FILENAME = "desktop-print-worker.json";
 const DISCOVERY_PORTS = [9100, 515, 631];
+const RT_DISCOVERY_PORTS = [8008, 80, 443];
 const DISCOVERY_TIMEOUT_MIN = 120;
 const DISCOVERY_TIMEOUT_MAX = 2000;
 const DISCOVERY_TIMEOUT_DEFAULT = 350;
@@ -198,9 +211,13 @@ function sanitizePhysicalPort(value: unknown, brand: string) {
   return brand === "epson" ? 8008 : 9100;
 }
 
-function sanitizePhysicalPath(value: unknown) {
+function defaultPhysicalPathByBrand(brand: string) {
+  return brand === "epson" ? "/cgi-bin/fpmate.cgi" : "/";
+}
+
+function sanitizePhysicalPath(value: unknown, brand = "epson") {
   const pathValue = String(value ?? "").trim();
-  if (!pathValue) return "/cgi-bin/fpmate.cgi";
+  if (!pathValue) return defaultPhysicalPathByBrand(brand);
   return pathValue.startsWith("/") ? pathValue : `/${pathValue}`;
 }
 
@@ -449,6 +466,63 @@ function classifyInterfaceConnectionType(interfaceName: string): "ethernet" | "w
   return "unknown";
 }
 
+function inferRtBrandFromContent(content: string): DiscoverRtDevice["brand"] | null {
+  const normalized = String(content || "").toLowerCase();
+  if (!normalized) return null;
+  if (normalized.includes("epson") || normalized.includes("fpmate") || normalized.includes("fp90")) return "epson";
+  if (normalized.includes("custom")) return "custom";
+  if (normalized.includes("olivetti")) return "olivetti";
+  if (normalized.includes("axon")) return "axon";
+  if (normalized.includes("rch")) return "rch";
+  return null;
+}
+
+function inferRtBrandByPort(port: number): DiscoverRtDevice["brand"] {
+  if (port === 8008) return "epson";
+  return "other";
+}
+
+function formatRtDeviceLabel(brand: DiscoverRtDevice["brand"], host: string) {
+  const brandLabel =
+    brand === "epson"
+      ? "Epson RT"
+      : brand === "custom"
+      ? "Custom RT"
+      : brand === "olivetti"
+      ? "Olivetti RT"
+      : brand === "axon"
+      ? "Axon RT"
+      : brand === "rch"
+      ? "RCH RT"
+      : "RT device";
+  return `${brandLabel} ${host}`;
+}
+
+async function fingerprintRtHttp(host: string, port: number, timeoutMs: number) {
+  const protocol = port === 443 ? "https" : "http";
+  const endpoint = `${protocol}://${host}:${port}/`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(300, timeoutMs));
+  try {
+    const response = await fetch(endpoint, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    const text = await response.text().catch(() => "");
+    const headerHints = [
+      response.headers.get("server") || "",
+      response.headers.get("x-powered-by") || "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return `${headerHints}\n${text}`.slice(0, 3000);
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function normalizeIpv4(address: string) {
   const raw = String(address || "").trim();
   const parts = raw.split(".");
@@ -691,6 +765,10 @@ export class DesktopPrintWorker {
 
   async discoverPrinters(timeoutMs?: number) {
     return this.discoverNetworkPrinters(timeoutMs);
+  }
+
+  async discoverRtDevices(timeoutMs?: number) {
+    return this.discoverNetworkRtDevices(timeoutMs);
   }
 
   private pushLog(level: WorkerLogRow["level"], message: string) {
@@ -1010,7 +1088,7 @@ export class DesktopPrintWorker {
     const host = String(route.host ?? "").trim();
     const brand = normalizePhysicalBrand(route.brand);
     const port = sanitizePhysicalPort(route.port, brand);
-    const apiPath = sanitizePhysicalPath(route.api_path);
+    const apiPath = sanitizePhysicalPath(route.api_path, brand);
     if (!host) throw new Error("PHYSICAL_RT_HOST_MISSING");
 
     const endpoint = `http://${host}:${port}${apiPath}`;
@@ -1231,6 +1309,58 @@ export class DesktopPrintWorker {
       timeout_ms: safeTimeout,
       scanned_ports: [...DISCOVERY_PORTS],
       printers,
+    };
+  }
+
+  private async discoverNetworkRtDevices(timeoutMs?: number) {
+    const safeTimeout = Number.isFinite(Number(timeoutMs))
+      ? Math.max(DISCOVERY_TIMEOUT_MIN, Math.min(DISCOVERY_TIMEOUT_MAX, Math.trunc(Number(timeoutMs))))
+      : DISCOVERY_TIMEOUT_DEFAULT;
+    const targets = collectLanTargets();
+    const devices: DiscoverRtDevice[] = [];
+
+    await runWithConcurrency(targets, DISCOVERY_CONCURRENCY, async (target) => {
+      const openPorts: number[] = [];
+      for (const port of RT_DISCOVERY_PORTS) {
+        const isOpen = await probeTcpPort(target.host, port, safeTimeout);
+        if (isOpen) openPorts.push(port);
+      }
+      if (openPorts.length === 0) return;
+
+      const preferredPort = openPorts.includes(8008) ? 8008 : openPorts.includes(80) ? 80 : openPorts[0];
+      let brand = inferRtBrandByPort(preferredPort);
+
+      // Lightweight fingerprint to improve brand inference where possible.
+      const httpPort = openPorts.includes(80) ? 80 : openPorts.includes(8008) ? 8008 : openPorts.includes(443) ? 443 : null;
+      if (httpPort != null) {
+        const fingerprint = await fingerprintRtHttp(target.host, httpPort, safeTimeout);
+        const inferred = inferRtBrandFromContent(fingerprint);
+        if (inferred) {
+          brand = inferred;
+        }
+      }
+
+      devices.push({
+        host: target.host,
+        port: preferredPort,
+        brand,
+        api_path: defaultPhysicalPathByBrand(brand),
+        connection_type: target.connectionType,
+        interface_name: target.interfaceName,
+        interface_ip: target.interfaceIp,
+        source: "lan_scan",
+        label: formatRtDeviceLabel(brand, target.host),
+      });
+    });
+
+    devices.sort((a, b) => a.host.localeCompare(b.host, "en", { numeric: true, sensitivity: "base" }));
+    return {
+      ok: true as const,
+      generated_at: new Date().toISOString(),
+      scanned_hosts: targets.length,
+      timeout_ms: safeTimeout,
+      scanned_ports: [...RT_DISCOVERY_PORTS],
+      devices,
     };
   }
 }

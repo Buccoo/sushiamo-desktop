@@ -19,6 +19,12 @@
     "productName": "SushiAMO Desktop",
     "asar": true,
     "compression": "maximum",
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://www.sushiamo.app/downloads"
+      }
+    ],
     "directories": {
       "output": "dist-desktop"
     },

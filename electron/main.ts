@@ -36,8 +36,15 @@ type WindowState = {
   isMaximized?: boolean;
 };
 
+type SavedDesktopCredentials = {
+  email: string;
+  password: string;
+  updatedAt: string;
+};
+
 const DESKTOP_PROTOCOL = "sushiamo";
 const WINDOW_STATE_FILE = "window-state.json";
+const CREDENTIALS_FILE = "desktop-credentials.json";
 const LOG_DIR = "logs";
 const LOG_FILE = "desktop-warn-error.log";
 const DEV_SERVER_URL = process.env.ELECTRON_DEV_SERVER_URL;
@@ -52,8 +59,58 @@ const runtimeConfig = loadDesktopRuntimeConfig();
 let printWorker: InstanceType<typeof DesktopPrintWorker> | null = null;
 let desktopAutoUpdateEnabled = false;
 let desktopUpdateDownloaded = false;
+let desktopUpdateAvailable = false;
+let desktopUpdateInfo: { version?: string | null; releaseName?: string | null; releaseDate?: string | null } | null = null;
 let desktopUpdateCheckInProgress = false;
 let desktopUpdateListenersBound = false;
+let desktopUpdateFeedCandidates: string[] = [];
+let desktopUpdateFeedIndex = 0;
+
+function getCredentialsPath() {
+  return path.join(app.getPath("userData"), CREDENTIALS_FILE);
+}
+
+async function readSavedCredentials(): Promise<SavedDesktopCredentials | null> {
+  try {
+    const raw = await fs.promises.readFile(getCredentialsPath(), "utf8");
+    const parsed = JSON.parse(raw) as Partial<SavedDesktopCredentials>;
+    const email = String(parsed.email || "").trim();
+    const password = String(parsed.password || "");
+    if (!email || !password) return null;
+    return {
+      email,
+      password,
+      updatedAt: String(parsed.updatedAt || new Date().toISOString()),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeSavedCredentials(payload: { email?: unknown; password?: unknown }) {
+  const email = String(payload.email || "").trim();
+  const password = String(payload.password || "");
+  if (!email || !password) {
+    throw new Error("INVALID_CREDENTIALS_PAYLOAD");
+  }
+  const data: SavedDesktopCredentials = {
+    email,
+    password,
+    updatedAt: new Date().toISOString(),
+  };
+  await fs.promises.mkdir(path.dirname(getCredentialsPath()), { recursive: true });
+  await fs.promises.writeFile(getCredentialsPath(), `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  return { ok: true as const };
+}
+
+async function clearSavedCredentials() {
+  try {
+    await fs.promises.unlink(getCredentialsPath());
+  } catch {
+    // ignore
+  }
+  return { ok: true as const };
+}
 
 function ensureWritableLogFile(filePath: string) {
   try {
@@ -377,7 +434,7 @@ function setupApplicationMenu() {
       }
       try {
         desktopUpdateCheckInProgress = true;
-        await autoUpdater.checkForUpdates();
+        await checkForUpdatesWithFeedFallback();
       } catch (error) {
         desktopUpdateCheckInProgress = false;
         log("WARN", "menu: check for updates failed", error instanceof Error ? error.message : String(error));
@@ -431,8 +488,63 @@ function setupApplicationMenu() {
       submenu: [
         { label: `SushiAMO Desktop v${appVersion}`, enabled: false },
         { type: "separator" as const },
-        ...(!isMac ? [checkForUpdatesItem, { type: "separator" as const }] : []),
+        {
+          label: "Aggiorna pagina",
+          accelerator: "CmdOrCtrl+R",
+          click: () => {
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            mainWindow.webContents.reloadIgnoringCache();
+          },
+        },
+        { type: "separator" as const },
         { role: "quit" as const, label: "Esci" },
+      ],
+    },
+    {
+      label: "Aggiornamenti",
+      submenu: [
+        checkForUpdatesItem,
+        {
+          label: "Scarica aggiornamento",
+          click: async () => {
+            if (!desktopAutoUpdateEnabled) {
+              await shell.openExternal("https://github.com/Buccoo/sushiamo-desktop/releases/latest");
+              return;
+            }
+            if (!desktopUpdateAvailable) {
+              try {
+                desktopUpdateCheckInProgress = true;
+                await checkForUpdatesWithFeedFallback();
+              } catch (error) {
+                desktopUpdateCheckInProgress = false;
+                log("WARN", "menu: check before download failed", error instanceof Error ? error.message : String(error));
+                return;
+              }
+            }
+            try {
+              await autoUpdater.downloadUpdate();
+            } catch (error) {
+              log("WARN", "menu: download update failed", error instanceof Error ? error.message : String(error));
+            }
+          },
+        },
+        {
+          label: "Installa aggiornamento",
+          click: async () => {
+            if (!desktopAutoUpdateEnabled) return;
+            if (!desktopUpdateDownloaded) {
+              try {
+                await autoUpdater.downloadUpdate();
+              } catch (error) {
+                log("WARN", "menu: install requested before download", error instanceof Error ? error.message : String(error));
+                return;
+              }
+            }
+            setTimeout(() => {
+              autoUpdater.quitAndInstall(false, true);
+            }, 200);
+          },
+        },
       ],
     },
     {
@@ -464,14 +576,21 @@ function setupAutoUpdaterScaffold() {
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.logger = null;
 
-  const updateUrl = String(runtimeConfig.SUSHIAMO_DESKTOP_UPDATE_URL || "").trim();
-  if (updateUrl) {
-    try {
-      autoUpdater.setFeedURL({ provider: "generic", url: updateUrl });
-      log("INFO", "desktop updater feed configured", { url: updateUrl });
-    } catch (error) {
-      log("WARN", "desktop updater feed configuration failed", error instanceof Error ? error.message : String(error));
-    }
+  const explicitUpdateUrl = String(runtimeConfig.SUSHIAMO_DESKTOP_UPDATE_URL || "").trim();
+  const publicAppUrl = String(runtimeConfig.PUBLIC_APP_URL || "").trim().replace(/\/+$/, "");
+  const derivedFromPublicApp = publicAppUrl ? `${publicAppUrl}/downloads` : "";
+  const feedCandidates = [
+    explicitUpdateUrl,
+    derivedFromPublicApp,
+    "https://www.sushiamo.app/downloads",
+    "https://sushiamo.app/downloads",
+  ]
+    .map((value) => String(value || "").trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  desktopUpdateFeedCandidates = [...new Set(feedCandidates)];
+  desktopUpdateFeedIndex = 0;
+  if (desktopUpdateFeedCandidates.length > 0) {
+    configureDesktopUpdaterFeed(desktopUpdateFeedCandidates[desktopUpdateFeedIndex]);
   }
 
   if (desktopUpdateListenersBound) return;
@@ -483,7 +602,13 @@ function setupAutoUpdaterScaffold() {
   });
 
   autoUpdater.on("update-available", (info) => {
+    desktopUpdateAvailable = true;
     desktopUpdateDownloaded = false;
+    desktopUpdateInfo = {
+      version: info.version || null,
+      releaseName: info.releaseName || null,
+      releaseDate: info.releaseDate || null,
+    };
     emitDesktopUpdateEvent({
       type: "update-available",
       data: {
@@ -495,7 +620,13 @@ function setupAutoUpdaterScaffold() {
   });
 
   autoUpdater.on("update-not-available", (info) => {
+    desktopUpdateAvailable = false;
     desktopUpdateDownloaded = false;
+    desktopUpdateInfo = {
+      version: info.version || null,
+      releaseName: null,
+      releaseDate: null,
+    };
     emitDesktopUpdateEvent({
       type: "update-not-available",
       data: {
@@ -517,8 +648,14 @@ function setupAutoUpdaterScaffold() {
   });
 
   autoUpdater.on("update-downloaded", (info) => {
+    desktopUpdateAvailable = true;
     desktopUpdateDownloaded = true;
     desktopUpdateCheckInProgress = false;
+    desktopUpdateInfo = {
+      version: info.version || null,
+      releaseName: info.releaseName || null,
+      releaseDate: info.releaseDate || null,
+    };
     emitDesktopUpdateEvent({
       type: "update-downloaded",
       data: {
@@ -536,6 +673,56 @@ function setupAutoUpdaterScaffold() {
       data: { message },
     });
   });
+}
+
+function configureDesktopUpdaterFeed(feedUrl: string) {
+  try {
+    autoUpdater.setFeedURL({ provider: "generic", url: feedUrl });
+    log("INFO", "desktop updater feed configured", { url: feedUrl });
+    return true;
+  } catch (error) {
+    log("WARN", "desktop updater feed configuration failed", {
+      url: feedUrl,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+function isUnauthorizedUpdaterError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /401|unauthorized|status code 401/i.test(message);
+}
+
+async function checkForUpdatesWithFeedFallback() {
+  const attempts = Math.max(1, desktopUpdateFeedCandidates.length);
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await autoUpdater.checkForUpdates();
+    } catch (error) {
+      lastError = error;
+      const canSwitch =
+        isUnauthorizedUpdaterError(error) &&
+        desktopUpdateFeedCandidates.length > 1 &&
+        attempt < attempts - 1;
+
+      if (!canSwitch) {
+        throw error;
+      }
+
+      desktopUpdateFeedIndex = (desktopUpdateFeedIndex + 1) % desktopUpdateFeedCandidates.length;
+      const nextFeed = desktopUpdateFeedCandidates[desktopUpdateFeedIndex];
+      log("WARN", "desktop updater unauthorized response, switching feed", {
+        nextFeed,
+      });
+      configureDesktopUpdaterFeed(nextFeed);
+    }
+  }
+
+  if (lastError) throw lastError;
+  throw new Error("Updater check failed");
 }
 
 async function loadRendererWithRetry(win: BrowserWindow) {
@@ -727,24 +914,38 @@ app
       if (opened) return { ok: false, reason: opened };
       return { ok: true };
     });
+    ipcMain.handle("desktop:credentials:get", async () => {
+      const credentials = await readSavedCredentials();
+      return credentials || null;
+    });
+    ipcMain.handle("desktop:credentials:set", async (_event, payload) => {
+      return writeSavedCredentials((payload || {}) as { email?: unknown; password?: unknown });
+    });
+    ipcMain.handle("desktop:credentials:clear", async () => {
+      return clearSavedCredentials();
+    });
     ipcMain.handle("desktop:check-for-updates", async () => {
       if (!desktopAutoUpdateEnabled) {
         return {
           enabled: false,
           currentVersion: app.getVersion(),
+          available: false,
+          downloaded: false,
+          updateInfo: null,
           reason: app.isPackaged ? "DISABLED_BY_CONFIG" : "NOT_PACKAGED",
         };
       }
       desktopUpdateCheckInProgress = true;
       try {
-        const result = await autoUpdater.checkForUpdates();
+        const result = await checkForUpdatesWithFeedFallback();
         desktopUpdateCheckInProgress = false;
         return {
           enabled: true,
           currentVersion: app.getVersion(),
           checking: false,
+          available: desktopUpdateAvailable,
           downloaded: desktopUpdateDownloaded,
-          updateInfo: result?.updateInfo || null,
+          updateInfo: result?.updateInfo || desktopUpdateInfo || null,
         };
       } catch (error) {
         desktopUpdateCheckInProgress = false;
@@ -752,6 +953,9 @@ app
           enabled: true,
           currentVersion: app.getVersion(),
           checking: false,
+          available: desktopUpdateAvailable,
+          downloaded: desktopUpdateDownloaded,
+          updateInfo: desktopUpdateInfo || null,
           error: error instanceof Error ? error.message : String(error),
         };
       }
@@ -760,8 +964,10 @@ app
       return {
         enabled: desktopAutoUpdateEnabled,
         checking: desktopUpdateCheckInProgress,
+        available: desktopUpdateAvailable,
         downloaded: desktopUpdateDownloaded,
         currentVersion: app.getVersion(),
+        updateInfo: desktopUpdateInfo || null,
       };
     });
     ipcMain.handle("desktop:download-update", async () => {
@@ -830,6 +1036,11 @@ app
       if (!printWorker) throw new Error("PRINT_WORKER_UNAVAILABLE");
       const timeoutMs = Number((payload as Record<string, unknown> | null)?.timeoutMs);
       return printWorker.discoverPrinters(Number.isFinite(timeoutMs) ? timeoutMs : undefined);
+    });
+    ipcMain.handle("desktop:printer:discover-rt", async (_event, payload) => {
+      if (!printWorker) throw new Error("PRINT_WORKER_UNAVAILABLE");
+      const timeoutMs = Number((payload as Record<string, unknown> | null)?.timeoutMs);
+      return printWorker.discoverRtDevices(Number.isFinite(timeoutMs) ? timeoutMs : undefined);
     });
   })
   .catch((error) => {
