@@ -49,6 +49,8 @@ const LOG_DIR = "logs";
 const LOG_FILE = "desktop-warn-error.log";
 const DEV_SERVER_URL = process.env.ELECTRON_DEV_SERVER_URL;
 const WINDOW_ICON_NAME = "favicon.png";
+const DEFAULT_UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+const MIN_UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 1000;
 
 let mainWindow: BrowserWindow | null = null;
 let pendingDeepLinkRoute: string | null = null;
@@ -65,6 +67,7 @@ let desktopUpdateCheckInProgress = false;
 let desktopUpdateListenersBound = false;
 let desktopUpdateFeedCandidates: string[] = [];
 let desktopUpdateFeedIndex = 0;
+let desktopUpdateIntervalHandle: NodeJS.Timeout | null = null;
 
 function getCredentialsPath() {
   return path.join(app.getPath("userData"), CREDENTIALS_FILE);
@@ -497,54 +500,9 @@ function setupApplicationMenu() {
           },
         },
         { type: "separator" as const },
-        { role: "quit" as const, label: "Esci" },
-      ],
-    },
-    {
-      label: "Aggiornamenti",
-      submenu: [
         checkForUpdatesItem,
-        {
-          label: "Scarica aggiornamento",
-          click: async () => {
-            if (!desktopAutoUpdateEnabled) {
-              await shell.openExternal("https://github.com/Buccoo/sushiamo-desktop/releases/latest");
-              return;
-            }
-            if (!desktopUpdateAvailable) {
-              try {
-                desktopUpdateCheckInProgress = true;
-                await checkForUpdatesWithFeedFallback();
-              } catch (error) {
-                desktopUpdateCheckInProgress = false;
-                log("WARN", "menu: check before download failed", error instanceof Error ? error.message : String(error));
-                return;
-              }
-            }
-            try {
-              await autoUpdater.downloadUpdate();
-            } catch (error) {
-              log("WARN", "menu: download update failed", error instanceof Error ? error.message : String(error));
-            }
-          },
-        },
-        {
-          label: "Installa aggiornamento",
-          click: async () => {
-            if (!desktopAutoUpdateEnabled) return;
-            if (!desktopUpdateDownloaded) {
-              try {
-                await autoUpdater.downloadUpdate();
-              } catch (error) {
-                log("WARN", "menu: install requested before download", error instanceof Error ? error.message : String(error));
-                return;
-              }
-            }
-            setTimeout(() => {
-              autoUpdater.quitAndInstall(false, true);
-            }, 200);
-          },
-        },
+        { type: "separator" as const },
+        { role: "quit" as const, label: "Esci" },
       ],
     },
     {
@@ -565,6 +523,50 @@ function setupApplicationMenu() {
 
   const menu = Menu.buildFromTemplate(template);
   Menu.setApplicationMenu(menu);
+}
+
+function getUpdateCheckIntervalMs() {
+  const envValue = Number(process.env.SUSHIAMO_DESKTOP_UPDATE_CHECK_INTERVAL_MS || "");
+  const resolved = Number.isFinite(envValue) && envValue > 0 ? envValue : DEFAULT_UPDATE_CHECK_INTERVAL_MS;
+  return Math.max(MIN_UPDATE_CHECK_INTERVAL_MS, resolved);
+}
+
+function startDesktopAutoUpdatePolling() {
+  if (!desktopAutoUpdateEnabled) return;
+
+  if (desktopUpdateIntervalHandle) {
+    clearInterval(desktopUpdateIntervalHandle);
+    desktopUpdateIntervalHandle = null;
+  }
+
+  const intervalMs = getUpdateCheckIntervalMs();
+  log("INFO", "desktop updater polling started", { intervalMs });
+
+  desktopUpdateIntervalHandle = setInterval(() => {
+    if (!desktopAutoUpdateEnabled) return;
+    if (desktopUpdateCheckInProgress) return;
+    if (desktopUpdateDownloaded) return;
+
+    void (async () => {
+      try {
+        desktopUpdateCheckInProgress = true;
+        await checkForUpdatesWithFeedFallback();
+      } catch (error) {
+        desktopUpdateCheckInProgress = false;
+        log(
+          "WARN",
+          "desktop updater periodic check failed",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    })();
+  }, intervalMs);
+}
+
+function stopDesktopAutoUpdatePolling() {
+  if (!desktopUpdateIntervalHandle) return;
+  clearInterval(desktopUpdateIntervalHandle);
+  desktopUpdateIntervalHandle = null;
 }
 
 function setupAutoUpdaterScaffold() {
@@ -885,6 +887,7 @@ app
     });
     await printWorker.init();
     await createMainWindow();
+    startDesktopAutoUpdatePolling();
 
     const initialDeepLink = extractDeepLinkFromArgv(process.argv);
     if (initialDeepLink) {
@@ -1071,6 +1074,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  stopDesktopAutoUpdatePolling();
   if (printWorker) {
     void printWorker.shutdown();
   }
