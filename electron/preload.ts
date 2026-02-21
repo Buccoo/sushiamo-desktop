@@ -134,6 +134,8 @@ contextBridge.exposeInMainWorld("desktopShell", {
         "desktop:printer:discover-rt",
         Number.isFinite(Number(timeoutMs)) ? { timeoutMs: Number(timeoutMs) } : {},
       ),
+    testRtReceipt: (config: { host: string; port: number; brand: string; api_path: string }) =>
+      ipcRenderer.invoke("desktop:printer:test-rt-receipt", config || {}),
     onState: (callback: (state: unknown) => void) => {
       if (typeof callback !== "function") return () => {};
       const handler = (_event: unknown, state: unknown) => callback(state);

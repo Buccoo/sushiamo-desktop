@@ -1042,6 +1042,16 @@ app
       const timeoutMs = Number((payload as Record<string, unknown> | null)?.timeoutMs);
       return printWorker.discoverRtDevices(Number.isFinite(timeoutMs) ? timeoutMs : undefined);
     });
+    ipcMain.handle("desktop:printer:test-rt-receipt", async (_event, payload) => {
+      if (!printWorker) throw new Error("PRINT_WORKER_UNAVAILABLE");
+      const config = (payload || {}) as { host?: string; port?: number; brand?: string; api_path?: string };
+      return printWorker.testRtReceipt({
+        host: String(config.host ?? ""),
+        port: Number(config.port ?? 80),
+        brand: String(config.brand ?? "epson"),
+        api_path: String(config.api_path ?? "/cgi-bin/fpmate.cgi"),
+      });
+    });
   })
   .catch((error) => {
     log("ERROR", "desktop startup failed", error instanceof Error ? error.stack || error.message : String(error));

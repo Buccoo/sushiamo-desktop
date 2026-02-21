@@ -259,6 +259,27 @@ function buildEpsonFiscalReceiptXml(payload: Record<string, unknown>) {
   );
 }
 
+function buildNonFiscalTestXml() {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit", year: "numeric" });
+  const timeStr = now.toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<FPMessage>\n` +
+    `  <beginNonFiscal operator="1"/>\n` +
+    `  <printNormal data="================================"/>\n` +
+    `  <printNormal data="   SCONTRINO DI PROVA"/>\n` +
+    `  <printNormal data="   TEST RECEIPT"/>\n` +
+    `  <printNormal data=""/>\n` +
+    `  <printNormal data="   SushiAMO Desktop"/>\n` +
+    `  <printNormal data="   Connessione OK"/>\n` +
+    `  <printNormal data="   ${dateStr}  ${timeStr}"/>\n` +
+    `  <printNormal data="================================"/>\n` +
+    `  <endNonFiscal/>\n` +
+    `</FPMessage>`
+  );
+}
+
 function extractReceiptIdFromResponse(responseText: string) {
   const text = String(responseText || "");
   if (!text) return null;
@@ -769,6 +790,48 @@ export class DesktopPrintWorker {
 
   async discoverRtDevices(timeoutMs?: number) {
     return this.discoverNetworkRtDevices(timeoutMs);
+  }
+
+  async testRtReceipt(config: { host: string; port: number; brand: string; api_path: string }): Promise<{ ok: boolean; error?: string; elapsed_ms?: number }> {
+    const host = String(config?.host ?? "").trim();
+    const brand = normalizePhysicalBrand(config?.brand);
+    const port = sanitizePhysicalPort(config?.port, brand);
+    const apiPath = sanitizePhysicalPath(config?.api_path, brand);
+    if (!host) return { ok: false, error: "PHYSICAL_RT_HOST_MISSING" };
+
+    const endpoint = `http://${host}:${port}${apiPath}`;
+    const body = buildNonFiscalTestXml();
+    const t0 = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/xml; charset=utf-8" },
+        body,
+        signal: controller.signal,
+      });
+      const responseText = await response.text().catch(() => "");
+      const elapsed = Date.now() - t0;
+
+      if (!response.ok) {
+        return { ok: false, error: `HTTP ${response.status}: ${responseText.slice(0, 300) || "errore"}`, elapsed_ms: elapsed };
+      }
+      if (/\b(error|fault|ko)\b/i.test(responseText)) {
+        return { ok: false, error: responseText.slice(0, 300) || "RT_ERROR_RESPONSE", elapsed_ms: elapsed };
+      }
+
+      this.pushLog("INFO", `Test RT receipt OK → ${endpoint} (${elapsed}ms)`);
+      return { ok: true, elapsed_ms: elapsed };
+    } catch (err: unknown) {
+      const elapsed = Date.now() - t0;
+      const message = err instanceof Error ? err.message : String(err);
+      this.pushLog("WARN", `Test RT receipt FAIL → ${endpoint}: ${message}`);
+      return { ok: false, error: message, elapsed_ms: elapsed };
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private pushLog(level: WorkerLogRow["level"], message: string) {
