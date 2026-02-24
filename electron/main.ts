@@ -917,6 +917,25 @@ app
       if (opened) return { ok: false, reason: opened };
       return { ok: true };
     });
+    ipcMain.handle("desktop:refocus-window", async () => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        return { ok: false, reason: "WINDOW_UNAVAILABLE" };
+      }
+      try {
+        if (mainWindow.isMinimized()) {
+          mainWindow.restore();
+        }
+        mainWindow.show();
+        mainWindow.focus();
+        mainWindow.webContents.focus();
+        return { ok: true };
+      } catch (error) {
+        return {
+          ok: false,
+          reason: error instanceof Error ? error.message : String(error || "FOCUS_FAILED"),
+        };
+      }
+    });
     ipcMain.handle("desktop:credentials:get", async () => {
       const credentials = await readSavedCredentials();
       return credentials || null;

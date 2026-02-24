@@ -109,6 +109,7 @@ contextBridge.exposeInMainWorld("desktopShell", {
   getRuntimeConfig: () => ({ ...runtimeConfig }),
   getDebugInfo: () => ipcRenderer.invoke("desktop:get-debug-info"),
   openLogFolder: () => ipcRenderer.invoke("desktop:open-log-folder"),
+  refocusWindow: () => ipcRenderer.invoke("desktop:refocus-window"),
   getSavedCredentials: () => ipcRenderer.invoke("desktop:credentials:get"),
   saveCredentials: (payload: { email?: unknown; password?: unknown }) =>
     ipcRenderer.invoke("desktop:credentials:set", payload || {}),

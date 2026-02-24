@@ -393,15 +393,12 @@ function formatTimestamp(value: unknown) {
   if (!value) return "";
   const date = new Date(String(value));
   if (Number.isNaN(date.getTime())) return String(value);
-  return date.toLocaleString("it-IT", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${year}/${month}/${day} ${hours}:${minutes}`;
 }
 
 function renderTicket(job: JobRow) {
@@ -414,18 +411,17 @@ function renderTicket(job: JobRow) {
   const orderLabel = payload.order_number != null ? `#${String(payload.order_number)}` : "#-";
   const createdAt = formatTimestamp(payload.created_at || job.created_at);
   const lines: string[] = [];
-  lines.push(`${orderLabel} - COMANDA ${department}`);
+  lines.push(`COMANDA ${department.toUpperCase()}`);
+  lines.push(`ORDINE: ${orderLabel}`);
   lines.push("-".repeat(width));
   lines.push(`TAVOLO: ${tableLabel.toUpperCase()}`);
+  if (createdAt) lines.push(`DATA: ${createdAt}`);
   lines.push("");
   for (const rawItem of items) {
     const item = (rawItem || {}) as Record<string, unknown>;
     const qty = Math.max(1, Number(item.quantity) || 1);
-    const itemNumber = item.item_number != null ? `#${String(item.item_number)} ` : "";
-    const label = `${qty}x ${itemNumber}${String(item.name || "").trim()}`;
+    const label = `${qty}) ${String(item.name || "").trim().toUpperCase()}`;
     for (const chunk of wrapText(label, width)) lines.push(chunk);
-    const guest = String(item.guest_name || "").trim();
-    if (guest) for (const chunk of wrapText(`Ospite: ${guest}`, width - 2)) lines.push(` ${chunk}`);
     const notes = String(item.notes || "").trim();
     if (notes) for (const chunk of wrapText(`Nota: ${notes}`, width - 2)) lines.push(` ${chunk}`);
   }
@@ -439,12 +435,23 @@ function isBoldLine(line: string) {
   const trimmed = line.trim();
   if (!trimmed) return false;
   if (/^tavolo:/i.test(trimmed)) return true;
-  if (/^\d+\s*x\s+/i.test(trimmed)) return true;
+  if (/^data:/i.test(trimmed)) return true;
+  if (/^\d+\)\s+/i.test(trimmed)) return true;
   return false;
 }
 
-function isLargeLine(line: string) {
-  return /^tavolo:/i.test(line.trim());
+function getLinePrintSize(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed) return 0x00;
+  if (/^tavolo:/i.test(trimmed) || /^data:/i.test(trimmed)) {
+    // Double width + double height for table/date.
+    return 0x11;
+  }
+  if (/^\d+\)\s+/i.test(trimmed)) {
+    // Double height for product rows.
+    return 0x01;
+  }
+  return 0x00;
 }
 
 function buildEscPosPayload(ticketText: string) {
@@ -454,17 +461,22 @@ function buildEscPosPayload(ticketText: string) {
   const lines = ticketText.split(/\r?\n/);
   const chunks = [Buffer.from([ESC, 0x40])];
   let bold = false;
+  let size = 0x00;
   for (const line of lines) {
     const shouldBold = isBoldLine(line);
     if (shouldBold !== bold) {
       chunks.push(Buffer.from([ESC, 0x45, shouldBold ? 0x01 : 0x00]));
       bold = shouldBold;
     }
-    if (isLargeLine(line)) chunks.push(Buffer.from([GS, 0x21, 0x11]));
+    const nextSize = getLinePrintSize(line);
+    if (nextSize !== size) {
+      chunks.push(Buffer.from([GS, 0x21, nextSize]));
+      size = nextSize;
+    }
     chunks.push(Buffer.from(`${line}\n`, "utf8"));
-    if (isLargeLine(line)) chunks.push(Buffer.from([GS, 0x21, 0x00]));
   }
   if (bold) chunks.push(Buffer.from([ESC, 0x45, 0x00]));
+  if (size !== 0x00) chunks.push(Buffer.from([GS, 0x21, 0x00]));
   chunks.push(Buffer.from([ESC, 0x64, EXTRA_FEED_LINES]));
   chunks.push(Buffer.from([GS, 0x56, 0x00]));
   return Buffer.concat(chunks);
