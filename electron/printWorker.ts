@@ -401,6 +401,17 @@ function formatTimestamp(value: unknown) {
   return `${year}/${month}/${day} ${hours}:${minutes}`;
 }
 
+function prettifyDishName(value: unknown) {
+  const raw = String(value || "").trim().replace(/\s+/g, " ");
+  if (!raw) return "";
+  if (/[a-zàèéìòù]/.test(raw)) return raw;
+  return raw
+    .toLowerCase()
+    .split(" ")
+    .map((part) => (part ? `${part[0]?.toUpperCase() || ""}${part.slice(1)}` : part))
+    .join(" ");
+}
+
 function renderTicket(job: JobRow) {
   const width = 42;
   const payload = (job.payload || {}) as Record<string, unknown>;
@@ -411,23 +422,19 @@ function renderTicket(job: JobRow) {
   const orderLabel = payload.order_number != null ? `#${String(payload.order_number)}` : "#-";
   const createdAt = formatTimestamp(payload.created_at || job.created_at);
   const lines: string[] = [];
-  lines.push(`COMANDA ${department.toUpperCase()}`);
-  lines.push(`ORDINE: ${orderLabel}`);
-  lines.push("-".repeat(width));
+  lines.push(`COMANDA ${department.toUpperCase()} ${orderLabel}`);
   lines.push(`TAVOLO: ${tableLabel.toUpperCase()}`);
   if (createdAt) lines.push(`DATA: ${createdAt}`);
-  lines.push("");
+  lines.push("-".repeat(width));
   for (const rawItem of items) {
     const item = (rawItem || {}) as Record<string, unknown>;
     const qty = Math.max(1, Number(item.quantity) || 1);
-    const label = `${qty}) ${String(item.name || "").trim().toUpperCase()}`;
+    const label = `${qty}) ${prettifyDishName(item.name)}`;
     for (const chunk of wrapText(label, width)) lines.push(chunk);
     const notes = String(item.notes || "").trim();
     if (notes) for (const chunk of wrapText(`Nota: ${notes}`, width - 2)) lines.push(` ${chunk}`);
   }
-  lines.push("-".repeat(width));
-  lines.push(createdAt ? `${restaurantName} - ${createdAt}` : restaurantName);
-  lines.push("=".repeat(width));
+  lines.push(`-- ${restaurantName} --`);
   return lines.join("\n");
 }
 
@@ -457,9 +464,15 @@ function getLinePrintSize(line: string) {
 function buildEscPosPayload(ticketText: string) {
   const ESC = 0x1b;
   const GS = 0x1d;
-  const EXTRA_FEED_LINES = 14;
+  const EXTRA_FEED_LINES = 4;
   const lines = ticketText.split(/\r?\n/);
-  const chunks = [Buffer.from([ESC, 0x40])];
+  const chunks = [
+    Buffer.from([ESC, 0x40]),
+    // Alternate ESC/POS font (Font B) for a less rigid look.
+    Buffer.from([ESC, 0x4d, 0x01]),
+    // Slight character spacing improves readability on thermal heads.
+    Buffer.from([ESC, 0x20, 0x01]),
+  ];
   let bold = false;
   let size = 0x00;
   for (const line of lines) {
