@@ -442,7 +442,6 @@ function isBoldLine(line: string) {
   const trimmed = line.trim();
   if (!trimmed) return false;
   if (/^tavolo:/i.test(trimmed)) return true;
-  if (/^data:/i.test(trimmed)) return true;
   if (/^\d+\)\s+/i.test(trimmed)) return true;
   return false;
 }
@@ -450,21 +449,22 @@ function isBoldLine(line: string) {
 function getLinePrintSize(line: string) {
   const trimmed = line.trim();
   if (!trimmed) return 0x00;
-  if (/^tavolo:/i.test(trimmed) || /^data:/i.test(trimmed)) {
-    // Double width + double height for table/date.
+  if (/^tavolo:/i.test(trimmed)) {
+    // Double width + double height for table.
     return 0x11;
   }
   if (/^\d+\)\s+/i.test(trimmed)) {
-    // Double height for product rows.
-    return 0x01;
+    // Product rows as large as table rows.
+    return 0x11;
   }
+  // Keep date and other lines in normal size.
   return 0x00;
 }
 
 function buildEscPosPayload(ticketText: string) {
   const ESC = 0x1b;
   const GS = 0x1d;
-  const EXTRA_FEED_LINES = 4;
+  const EXTRA_FEED_LINES = 7;
   const lines = ticketText.split(/\r?\n/);
   const chunks = [
     Buffer.from([ESC, 0x40]),
