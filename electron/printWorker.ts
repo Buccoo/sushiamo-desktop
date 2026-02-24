@@ -51,6 +51,12 @@ type PhysicalReceiptJobRow = {
   created_at: string;
 };
 
+type NonFiscalReceiptJobRow = {
+  id: string;
+  payload: Record<string, unknown> | null;
+  created_at: string;
+};
+
 type LivePrinter = {
   id: string;
   name: string;
@@ -438,6 +444,61 @@ function renderTicket(job: JobRow) {
   return lines.join("\n");
 }
 
+function formatCurrency(value: unknown) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "€   0,00";
+  const str = Math.abs(n).toFixed(2).replace(".", ",");
+  return `€ ${str}`;
+}
+
+function padRow(label: string, value: string, width: number) {
+  const gap = width - label.length - value.length;
+  return label + " ".repeat(Math.max(1, gap)) + value;
+}
+
+function renderNonFiscalReceiptTicket(job: NonFiscalReceiptJobRow) {
+  const width = 42;
+  const payload = (job.payload || {}) as Record<string, unknown>;
+  const restaurantName = String(payload.restaurant_name || "").trim() || "Ristorante";
+  const tableLabel = String(payload.table_number || "").trim() || "-";
+  const paidAt = formatTimestamp(payload.paid_at || job.created_at);
+  const paymentMethod = normalizePaymentMethod(payload.payment_method);
+  const paymentLabel = paymentMethod === "card" ? "Carta" : "Contanti";
+  const ayceTotal = Number(payload.ayce_total) || 0;
+  const coverTotal = Number(payload.cover_total) || 0;
+  const extrasTotal = Number(payload.extras_total) || 0;
+  const totalAmount = Number(payload.total_amount) || 0;
+
+  const center = (text: string) => {
+    if (text.length >= width) return text;
+    const pad = Math.floor((width - text.length) / 2);
+    return " ".repeat(pad) + text;
+  };
+
+  const lines: string[] = [];
+  lines.push("=".repeat(width));
+  lines.push(center(restaurantName));
+  lines.push("=".repeat(width));
+  lines.push(center("SCONTRINO NON FISCALE"));
+  lines.push("-".repeat(width));
+  lines.push(`Tavolo: ${tableLabel}`);
+  if (paidAt) lines.push(`Data:   ${paidAt}`);
+  lines.push("-".repeat(width));
+
+  if (ayceTotal > 0) lines.push(padRow("AYCE", formatCurrency(ayceTotal), width));
+  if (coverTotal > 0) lines.push(padRow("Coperto", formatCurrency(coverTotal), width));
+  if (extrasTotal > 0) lines.push(padRow("Extra", formatCurrency(extrasTotal), width));
+
+  lines.push("-".repeat(width));
+  lines.push(padRow("TOTALE", formatCurrency(totalAmount), width));
+  lines.push(padRow("Pagamento", paymentLabel, width));
+  lines.push("=".repeat(width));
+  lines.push(center("Grazie per la visita!"));
+  lines.push(center("*** NON FISCALE ***"));
+  lines.push("=".repeat(width));
+  return lines.join("\n");
+}
+
 function isBoldLine(line: string) {
   const trimmed = line.trim();
   if (!trimmed) return false;
@@ -667,6 +728,7 @@ export class DesktopPrintWorker {
   private savedSession: SessionSnapshot | null = null;
   private supabase: SupabaseClient | null = null;
   private physicalReceiptRpcAvailable = true;
+  private nonFiscalReceiptRpcAvailable = true;
   private boundWindow: BrowserWindow | null = null;
   private service = {
     running: false,
@@ -786,6 +848,7 @@ export class DesktopPrintWorker {
       lastError: null,
     };
     this.physicalReceiptRpcAvailable = true;
+    this.nonFiscalReceiptRpcAvailable = true;
     this.pushLog("INFO", `Servizio stampa avviato (${this.config.consumerId})`);
     this.broadcastState();
     void this.runTick();
@@ -1249,6 +1312,39 @@ export class DesktopPrintWorker {
     if (error) throw error;
   }
 
+  private async sendToNonFiscalReceiptPrinter(job: NonFiscalReceiptJobRow) {
+    const payload = (job.payload && typeof job.payload === "object" ? job.payload : {}) as Record<string, unknown>;
+    const route = (payload.route && typeof payload.route === "object" ? payload.route : {}) as Record<string, unknown>;
+    const host = String(route.host ?? "").trim();
+    const port = sanitizePrinterPort(route.port ?? 9100);
+    if (!host) throw new Error("NO_PRINTER_HOST");
+    const ticketText = renderNonFiscalReceiptTicket(job);
+    const escPosPayload = buildEscPosPayload(ticketText);
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        await openRawSocket(host, port, escPosPayload);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt >= 2 || !shouldRetryPrintLocally(error)) break;
+        await sleep(500);
+      }
+    }
+    throw new Error(`${normalizeError(lastError)} (target ${host}:${port})`);
+  }
+
+  private async completeNonFiscalReceiptJob(job: NonFiscalReceiptJobRow, success: boolean, errorMessage: string | null) {
+    const client = this.ensureSupabaseClient();
+    const { error } = await client.rpc("non_fiscal_receipt_complete_job", {
+      p_job_id: job.id,
+      p_consumer_id: this.config.consumerId,
+      p_success: success,
+      p_error: success ? null : String(errorMessage || "PRINT_FAILED").slice(0, 500),
+    });
+    if (error) throw error;
+  }
+
   private async runTick() {
     if (!this.service.running || this.service.processing) return;
     this.service.processing = true;
@@ -1341,6 +1437,55 @@ export class DesktopPrintWorker {
           }
         } catch (physicalTickError) {
           this.pushLog("ERROR", `Tick RT fisico: ${normalizeError(physicalTickError)}`);
+        }
+      }
+
+      if (this.nonFiscalReceiptRpcAvailable) {
+        try {
+          const { data: nfrData, error: nfrError } = await client.rpc("non_fiscal_receipt_claim_jobs", {
+            p_restaurant_id: this.authState.restaurant.id,
+            p_consumer_id: this.config.consumerId,
+            p_limit: this.config.claimLimit,
+          });
+
+          if (nfrError) {
+            if (isMissingRpcError(nfrError, "non_fiscal_receipt_claim_jobs")) {
+              this.nonFiscalReceiptRpcAvailable = false;
+              this.pushLog("WARN", "RPC non_fiscal_receipt_claim_jobs non trovata: applica la migrazione.");
+            } else {
+              throw nfrError;
+            }
+          } else {
+            const nfrJobs = (Array.isArray(nfrData) ? nfrData : []) as NonFiscalReceiptJobRow[];
+            this.service.stats.claimed += nfrJobs.length;
+            if (nfrJobs.length > 0) {
+              this.pushLog("INFO", `Claimati ${nfrJobs.length} job scontrino non fiscale`);
+            }
+
+            for (const job of nfrJobs) {
+              try {
+                await this.sendToNonFiscalReceiptPrinter(job);
+                await this.completeNonFiscalReceiptJob(job, true, null);
+                this.service.stats.printed += 1;
+                this.pushLog("INFO", `Stampato scontrino non fiscale ${String(job.id).slice(0, 8)}`);
+              } catch (jobError) {
+                const message = normalizeError(jobError);
+                try {
+                  await this.completeNonFiscalReceiptJob(job, false, message);
+                } catch (ackError) {
+                  if (isMissingRpcError(ackError, "non_fiscal_receipt_complete_job")) {
+                    this.nonFiscalReceiptRpcAvailable = false;
+                  } else {
+                    this.pushLog("ERROR", `Ack failed NFR job ${String(job.id).slice(0, 8)}: ${normalizeError(ackError)}`);
+                  }
+                }
+                this.service.stats.failed += 1;
+                this.pushLog("ERROR", `Errore NFR job ${String(job.id).slice(0, 8)}: ${message}`);
+              }
+            }
+          }
+        } catch (nfrTickError) {
+          this.pushLog("ERROR", `Tick scontrino non fiscale: ${normalizeError(nfrTickError)}`);
         }
       }
 
