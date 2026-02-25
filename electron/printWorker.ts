@@ -435,7 +435,7 @@ function renderTicket(job: JobRow) {
   for (const rawItem of items) {
     const item = (rawItem || {}) as Record<string, unknown>;
     const qty = Math.max(1, Number(item.quantity) || 1);
-    const label = `${qty}) ${prettifyDishName(item.name)}`;
+    const label = `${qty}x ${prettifyDishName(item.name)}`;
     for (const chunk of wrapText(label, width)) lines.push(chunk);
     const notes = String(item.notes || "").trim();
     if (notes) for (const chunk of wrapText(`Nota: ${notes}`, width - 2)) lines.push(` ${chunk}`);
@@ -503,7 +503,7 @@ function isBoldLine(line: string) {
   const trimmed = line.trim();
   if (!trimmed) return false;
   if (/^tavolo:/i.test(trimmed)) return true;
-  if (/^\d+\)\s+/i.test(trimmed)) return true;
+  if (/^\d+x\s+/i.test(trimmed)) return true;
   return false;
 }
 
@@ -514,7 +514,7 @@ function getLinePrintSize(line: string) {
     // Double width + double height for table.
     return 0x11;
   }
-  if (/^\d+\)\s+/i.test(trimmed)) {
+  if (/^\d+x\s+/i.test(trimmed)) {
     // Product rows as large as table rows.
     return 0x11;
   }
@@ -532,7 +532,7 @@ function buildEscPosPayload(ticketText: string) {
     // Alternate ESC/POS font (Font B) for a less rigid look.
     Buffer.from([ESC, 0x4d, 0x01]),
     // Slight character spacing improves readability on thermal heads.
-    Buffer.from([ESC, 0x20, 0x01]),
+    Buffer.from([ESC, 0x20, 0x02]),
   ];
   let bold = false;
   let size = 0x00;

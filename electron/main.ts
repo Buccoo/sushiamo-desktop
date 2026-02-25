@@ -56,6 +56,8 @@ let mainWindow: BrowserWindow | null = null;
 let pendingDeepLinkRoute: string | null = null;
 let resolvedLogFilePath: string | null = null;
 let didResolveLogFilePath = false;
+let rendererRetryAttempts = 0;
+const MAX_RENDERER_RETRY_ATTEMPTS = 4;
 
 const runtimeConfig = loadDesktopRuntimeConfig();
 let printWorker: InstanceType<typeof DesktopPrintWorker> | null = null;
@@ -260,7 +262,7 @@ async function showRendererFallback(win: BrowserWindow, reason: string, details?
     <div><strong>Motivo:</strong> ${escapeHtml(reason)}</div>
     <div style="margin-top:8px;"><strong>Log file:</strong> ${escapeHtml(logPath)}</div>
     ${payload ? `<pre>${escapeHtml(payload)}</pre>` : ""}
-    <a class="btn" href="#" onclick="window.location.reload(); return false;">Riprova caricamento</a>
+    <a class="btn" href="#" onclick="if(window.desktopShell&&window.desktopShell.reloadApp){window.desktopShell.reloadApp();}else{window.location.reload();} return false;">Riprova caricamento</a>
   </div>
 </body>
 </html>`;
@@ -810,10 +812,25 @@ async function createMainWindow() {
   mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
     const details = { errorCode, errorDescription, validatedURL };
     log("ERROR", "renderer failed to load", details);
-    if (errorCode !== -3) {
-      const win = mainWindow;
-      if (win) void showRendererFallback(win, "did-fail-load", details);
+    if (errorCode === -3) return; // aborted, ignore
+
+    // Auto-retry on transient network errors (DNS, connection refused, network changed)
+    const isRetriableError = errorCode === -105 || errorCode === -106 || errorCode === -21 || errorCode === -100;
+    const publicAppUrl = runtimeConfig.PUBLIC_APP_URL;
+    if (isRetriableError && publicAppUrl && !DEV_SERVER_URL && rendererRetryAttempts < MAX_RENDERER_RETRY_ATTEMPTS) {
+      rendererRetryAttempts++;
+      const delay = Math.min(2000 * rendererRetryAttempts, 8000);
+      log("WARN", `renderer load failed (${errorCode}), retry ${rendererRetryAttempts}/${MAX_RENDERER_RETRY_ATTEMPTS} in ${delay}ms`, {});
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        mainWindow.loadURL(publicAppUrl).catch(() => {});
+      }, delay);
+      return;
     }
+
+    rendererRetryAttempts = 0;
+    const win = mainWindow;
+    if (win) void showRendererFallback(win, "did-fail-load", details);
   });
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
     log("ERROR", "renderer process gone", details);
@@ -835,6 +852,7 @@ async function createMainWindow() {
   await loadRendererWithRetry(mainWindow);
 
   mainWindow.webContents.on("did-finish-load", () => {
+    rendererRetryAttempts = 0;
     log("INFO", "renderer did-finish-load", { url: mainWindow?.webContents.getURL() || null });
     if (pendingDeepLinkRoute) {
       sendDeepLinkToRenderer(pendingDeepLinkRoute);
@@ -917,6 +935,18 @@ app
       if (opened) return { ok: false, reason: opened };
       return { ok: true };
     });
+    ipcMain.handle("desktop:reload-app", async () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
+      rendererRetryAttempts = 0;
+      const publicAppUrl = runtimeConfig.PUBLIC_APP_URL;
+      if (publicAppUrl) {
+        mainWindow.loadURL(publicAppUrl).catch(() => {});
+      } else {
+        mainWindow.reload();
+      }
+      return { ok: true };
+    });
+
     ipcMain.handle("desktop:refocus-window", async () => {
       if (!mainWindow || mainWindow.isDestroyed()) {
         return { ok: false, reason: "WINDOW_UNAVAILABLE" };
