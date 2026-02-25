@@ -38,6 +38,11 @@
         "to": "desktop-runtime-config.json"
       }
     ],
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": false,
+      "runAfterFinish": true
+    },
     "win": {
       "target": [
         "nsis"
