@@ -446,9 +446,9 @@ function renderTicket(job: JobRow) {
 
 function formatCurrency(value: unknown) {
   const n = Number(value);
-  if (!Number.isFinite(n)) return "€   0,00";
+  if (!Number.isFinite(n)) return "EUR 0,00";
   const str = Math.abs(n).toFixed(2).replace(".", ",");
-  return `€ ${str}`;
+  return `EUR ${str}`;
 }
 
 function padRow(label: string, value: string, width: number) {
@@ -481,8 +481,8 @@ function renderNonFiscalReceiptTicket(job: NonFiscalReceiptJobRow) {
   lines.push("=".repeat(width));
   lines.push(center("SCONTRINO NON FISCALE"));
   lines.push("-".repeat(width));
-  lines.push(`Tavolo: ${tableLabel}`);
-  if (paidAt) lines.push(`Data:   ${paidAt}`);
+  lines.push(center(`Tavolo: ${tableLabel}`));
+  if (paidAt) lines.push(center(`Data:   ${paidAt}`));
   lines.push("-".repeat(width));
 
   if (ayceTotal > 0) lines.push(padRow("AYCE", formatCurrency(ayceTotal), width));
@@ -525,7 +525,7 @@ function getLinePrintSize(line: string) {
 function buildEscPosPayload(ticketText: string) {
   const ESC = 0x1b;
   const GS = 0x1d;
-  const EXTRA_FEED_LINES = 7;
+  const EXTRA_FEED_LINES = 5;
   const lines = ticketText.split(/\r?\n/);
   const chunks = [
     Buffer.from([ESC, 0x40]),
@@ -1597,3 +1597,4 @@ export class DesktopPrintWorker {
     };
   }
 }
+
