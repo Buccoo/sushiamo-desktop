@@ -36,10 +36,15 @@ type WindowState = {
   isMaximized?: boolean;
 };
 
-type SavedDesktopCredentials = {
+type SavedDesktopAccount = {
   email: string;
   password: string;
+  displayName?: string;
   updatedAt: string;
+};
+
+type SavedDesktopAccountsFile = {
+  accounts: SavedDesktopAccount[];
 };
 
 const DESKTOP_PROTOCOL = "sushiamo";
@@ -75,40 +80,66 @@ function getCredentialsPath() {
   return path.join(app.getPath("userData"), CREDENTIALS_FILE);
 }
 
-async function readSavedCredentials(): Promise<SavedDesktopCredentials | null> {
+async function readSavedAccounts(): Promise<SavedDesktopAccount[]> {
   try {
     const raw = await fs.promises.readFile(getCredentialsPath(), "utf8");
-    const parsed = JSON.parse(raw) as Partial<SavedDesktopCredentials>;
-    const email = String(parsed.email || "").trim();
-    const password = String(parsed.password || "");
-    if (!email || !password) return null;
-    return {
-      email,
-      password,
-      updatedAt: String(parsed.updatedAt || new Date().toISOString()),
-    };
+    const parsed = JSON.parse(raw) as unknown;
+
+    // Migrate old single-credential format { email, password, updatedAt }
+    if (parsed && typeof parsed === "object" && !Array.isArray((parsed as Record<string, unknown>).accounts)) {
+      const old = parsed as Partial<SavedDesktopAccount>;
+      const email = String(old.email || "").trim();
+      const password = String(old.password || "");
+      if (email && password) {
+        const migrated: SavedDesktopAccountsFile = {
+          accounts: [{ email, password, updatedAt: old.updatedAt || new Date().toISOString() }],
+        };
+        await fs.promises.writeFile(getCredentialsPath(), `${JSON.stringify(migrated, null, 2)}\n`, "utf8");
+        return migrated.accounts;
+      }
+      return [];
+    }
+
+    const file = parsed as SavedDesktopAccountsFile;
+    if (!Array.isArray(file.accounts)) return [];
+    return file.accounts.filter(
+      (a) => typeof a.email === "string" && a.email.trim() && typeof a.password === "string" && a.password,
+    );
   } catch {
-    return null;
+    return [];
   }
 }
 
-async function writeSavedCredentials(payload: { email?: unknown; password?: unknown }) {
+async function upsertSavedAccount(payload: { email?: unknown; password?: unknown; displayName?: unknown }) {
   const email = String(payload.email || "").trim();
   const password = String(payload.password || "");
-  if (!email || !password) {
-    throw new Error("INVALID_CREDENTIALS_PAYLOAD");
-  }
-  const data: SavedDesktopCredentials = {
+  if (!email || !password) throw new Error("INVALID_CREDENTIALS_PAYLOAD");
+
+  const existing = await readSavedAccounts();
+  const newAccount: SavedDesktopAccount = {
     email,
     password,
+    ...(payload.displayName ? { displayName: String(payload.displayName) } : {}),
     updatedAt: new Date().toISOString(),
   };
+  // Most recently used goes first; remove any existing entry for this email
+  const updated = [newAccount, ...existing.filter((a) => a.email !== email)];
+  const file: SavedDesktopAccountsFile = { accounts: updated };
   await fs.promises.mkdir(path.dirname(getCredentialsPath()), { recursive: true });
-  await fs.promises.writeFile(getCredentialsPath(), `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  await fs.promises.writeFile(getCredentialsPath(), `${JSON.stringify(file, null, 2)}\n`, "utf8");
   return { ok: true as const };
 }
 
-async function clearSavedCredentials() {
+async function removeSavedAccount(email: string) {
+  const existing = await readSavedAccounts();
+  const updated = existing.filter((a) => a.email !== email);
+  const file: SavedDesktopAccountsFile = { accounts: updated };
+  await fs.promises.mkdir(path.dirname(getCredentialsPath()), { recursive: true });
+  await fs.promises.writeFile(getCredentialsPath(), `${JSON.stringify(file, null, 2)}\n`, "utf8");
+  return { ok: true as const };
+}
+
+async function clearAllSavedAccounts() {
   try {
     await fs.promises.unlink(getCredentialsPath());
   } catch {
@@ -967,14 +998,22 @@ app
       }
     });
     ipcMain.handle("desktop:credentials:get", async () => {
-      const credentials = await readSavedCredentials();
-      return credentials || null;
+      const accounts = await readSavedAccounts();
+      return accounts[0] || null;
     });
     ipcMain.handle("desktop:credentials:set", async (_event, payload) => {
-      return writeSavedCredentials((payload || {}) as { email?: unknown; password?: unknown });
+      return upsertSavedAccount((payload || {}) as { email?: unknown; password?: unknown; displayName?: unknown });
     });
     ipcMain.handle("desktop:credentials:clear", async () => {
-      return clearSavedCredentials();
+      return clearAllSavedAccounts();
+    });
+    ipcMain.handle("desktop:accounts:get-all", async () => {
+      return readSavedAccounts();
+    });
+    ipcMain.handle("desktop:accounts:remove", async (_event, payload) => {
+      const email = String(((payload || {}) as Record<string, unknown>).email || "").trim();
+      if (!email) return { ok: false };
+      return removeSavedAccount(email);
     });
     ipcMain.handle("desktop:check-for-updates", async () => {
       if (!desktopAutoUpdateEnabled) {

@@ -112,9 +112,11 @@ contextBridge.exposeInMainWorld("desktopShell", {
   refocusWindow: () => ipcRenderer.invoke("desktop:refocus-window"),
   reloadApp: () => ipcRenderer.invoke("desktop:reload-app"),
   getSavedCredentials: () => ipcRenderer.invoke("desktop:credentials:get"),
-  saveCredentials: (payload: { email?: unknown; password?: unknown }) =>
+  saveCredentials: (payload: { email?: unknown; password?: unknown; displayName?: unknown }) =>
     ipcRenderer.invoke("desktop:credentials:set", payload || {}),
   clearSavedCredentials: () => ipcRenderer.invoke("desktop:credentials:clear"),
+  getSavedAccounts: () => ipcRenderer.invoke("desktop:accounts:get-all"),
+  removeAccount: (email: string) => ipcRenderer.invoke("desktop:accounts:remove", { email }),
   getUpdateState: () => ipcRenderer.invoke("desktop:get-update-state"),
   checkForUpdates: () => ipcRenderer.invoke("desktop:check-for-updates"),
   downloadUpdate: () => ipcRenderer.invoke("desktop:download-update"),
