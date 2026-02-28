@@ -12,6 +12,7 @@
     "build:mac": "npm run prepare-config && npm run build:ts && electron-builder --mac dmg --x64 --arm64 --publish never",
     "build:mac:arm64": "npm run prepare-config && npm run build:ts && electron-builder --mac dmg --arm64 --publish never",
     "build:mac:x64": "npm run prepare-config && npm run build:ts && electron-builder --mac dmg --x64 --publish never",
+    "build:mac:unsigned": "npm run prepare-config && npm run build:ts && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --x64 --arm64 --publish never",
     "dev": "npm run prepare-config && concurrently -k -n TS,ELECTRON \"npm run watch:ts\" \"wait-on electron-dist/main.cjs && cross-env ELECTRON_DEV_SERVER_URL=https://dashboard.sushiamo.app node scripts/desktop/run-electron-dev.mjs\""
   },
   "build": {
@@ -57,8 +58,11 @@
       "icon": "assets/favicon.png",
       "artifactName": "SushiAMO-Desktop-macOS-${arch}.${ext}",
       "category": "public.app-category.business",
-      "identity": null,
-      "hardenedRuntime": false
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist",
+      "notarize": true
     },
     "protocols": [
       {
